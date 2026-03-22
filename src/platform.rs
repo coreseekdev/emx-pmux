@@ -103,7 +103,7 @@ pub fn remove_pid_file() {
 // ── Daemon spawning ──────────────────────────────────────────────────
 
 /// Spawn the daemon as a detached background process by re-executing
-/// the current binary with the internal `daemon` subcommand.
+/// the current binary with the internal `--daemon` flag.
 pub fn spawn_daemon() -> io::Result<u32> {
     let exe = std::env::current_exe()?;
 
@@ -113,7 +113,7 @@ pub fn spawn_daemon() -> io::Result<u32> {
         // CREATE_NO_WINDOW | DETACHED_PROCESS
         const FLAGS: u32 = 0x08000000 | 0x00000008;
         let child = std::process::Command::new(exe)
-            .arg("daemon")
+            .arg("--daemon")
             .creation_flags(FLAGS)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -125,7 +125,7 @@ pub fn spawn_daemon() -> io::Result<u32> {
     #[cfg(unix)]
     {
         let child = std::process::Command::new(exe)
-            .arg("daemon")
+            .arg("--daemon")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
