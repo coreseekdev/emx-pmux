@@ -1,53 +1,79 @@
-//! Inter-Process Communication (IPC)
+//! IPC protocol for client ↔ daemon communication.
 //!
-//! Handles communication between server and client components.
+//! Length-prefixed JSON messages over local sockets (interprocess crate).
 
-/// IPC protocol messages
-#[derive(Debug, Clone)]
-pub enum IpcMessage {
-    /// Authentication: AUTH {key}
-    Auth { key: String },
+use serde::{Deserialize, Serialize};
+use std::io::{self, Read, Write};
 
-    /// Persistent mode flag
-    Persistent,
+use crate::session::SessionInfo;
 
-    /// Target specification
-    Target { target: String },
+// ── Request ──────────────────────────────────────────────────────────
 
-    /// Command to execute
-    Command { cmd: String },
-
-    /// Response from server
-    Response { data: String },
+/// Client → Daemon request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Request {
+    /// Create a new session.
+    NewSession {
+        name: Option<String>,
+        command: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    /// Kill a session.
+    KillSession { name: String },
+    /// List all sessions.
+    ListSessions,
+    /// Send data to a session's PTY stdin.
+    SendData { name: String, data: Vec<u8> },
+    /// View a session's screen content.
+    ViewScreen { name: String },
+    /// Resize a session's PTY.
+    ResizePty { name: String, cols: u16, rows: u16 },
+    /// Kill the daemon process.
+    KillServer,
+    /// Health check.
+    Ping,
 }
 
-/// IPC transport layer
-pub struct IpcTransport {
-    // TODO: add transport-specific fields
-    _private: (),
+// ── Response ─────────────────────────────────────────────────────────
+
+/// Daemon → Client response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Response {
+    Ok,
+    Created { name: String },
+    SessionList { sessions: Vec<SessionInfo> },
+    Screen { content: String },
+    Pong,
+    Error { message: String },
 }
 
-impl IpcTransport {
-    /// Create a new IPC transport
-    pub fn new() -> Self {
-        IpcTransport { _private: () }
-    }
+// ── Wire format ──────────────────────────────────────────────────────
+// 4 bytes big-endian length + JSON payload.
 
-    /// Connect to a server
-    pub fn connect(&mut self, port: u16) -> Result<(), String> {
-        // TODO: implement TCP connection
-        Ok(())
-    }
+const MAX_MSG: usize = 16 * 1024 * 1024; // 16 MiB
 
-    /// Send a message
-    pub fn send(&mut self, msg: &IpcMessage) -> Result<(), String> {
-        // TODO: implement message sending
-        Ok(())
+/// Send a serializable value over a stream.
+pub fn send_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
+    let json = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if json.len() > MAX_MSG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
     }
+    let len = (json.len() as u32).to_be_bytes();
+    w.write_all(&len)?;
+    w.write_all(&json)?;
+    w.flush()
+}
 
-    /// Receive a message
-    pub fn receive(&mut self) -> Result<IpcMessage, String> {
-        // TODO: implement message receiving
-        Err("not implemented".to_string())
+/// Receive a deserializable value from a stream.
+pub fn recv_msg<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<T> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_MSG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
     }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }

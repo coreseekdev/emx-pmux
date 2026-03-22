@@ -1,12 +1,10 @@
 [package]
 name = "pmux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["emx"]
-description = "A terminal multiplexer for Windows, inspired by tmux and screen"
+description = "A cross-platform terminal multiplexer with PTY management"
 license = "MIT"
-repository = "https://github.com/emx/pmux"
-readme = "README.md"
 
 [lib]
 name = "pmux"
@@ -17,9 +15,25 @@ name = "pmux"
 path = "src/main.rs"
 
 [dependencies]
-# Platform-specific dependencies
-[target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["process", "fs", "signal"] }
+interprocess = "2.2"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+vte = "0.13"
 
-# Optional: for UUID generation (can be replaced with simpler impl)
-uuid = { version = "1", optional = true }
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "0.38", features = ["process", "termios", "pty", "fs"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+] }
