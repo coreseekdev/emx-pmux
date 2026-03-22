@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod daemon;
 pub mod ipc;
+pub mod log;
 pub mod platform;
 pub mod pty;
 pub mod screen;

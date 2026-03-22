@@ -8,10 +8,12 @@ use std::io;
 
 use crate::ipc::{self, Message};
 use crate::platform;
+use crate::pmux_log;
 use crate::session::SessionManager;
 
 /// Run the daemon main loop (async). Does not return until shutdown.
 pub async fn run() -> io::Result<()> {
+    pmux_log!("daemon: starting (pid={})", std::process::id());
     platform::write_pid_file()?;
     let mut mgr = SessionManager::new();
     let mut had_sessions = false;
@@ -141,6 +143,7 @@ where
 
 /// Dispatch a message, returning (response, should_kill_server).
 fn dispatch(msg: Message, mgr: &mut SessionManager) -> (Message, bool) {
+    pmux_log!("dispatch: {:?}", msg);
     match msg {
         Message::Create {
             name,
@@ -168,7 +171,10 @@ fn dispatch(msg: Message, mgr: &mut SessionManager) -> (Message, bool) {
         },
 
         Message::ViewScreen { name } => match mgr.view(&name) {
-            Ok(content) => (Message::ScreenData { content }, false),
+            Ok(content) => {
+                pmux_log!("dispatch: ViewScreen({}) → {} bytes", name, content.len());
+                (Message::ScreenData { content }, false)
+            }
             Err(e) => (Message::Error { message: e }, false),
         },
 

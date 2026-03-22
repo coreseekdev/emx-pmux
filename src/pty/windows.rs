@@ -300,7 +300,9 @@ impl Read for PtyReader {
 fn create_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut read_h: HANDLE = INVALID_HANDLE_VALUE;
     let mut write_h: HANDLE = INVALID_HANDLE_VALUE;
-    if unsafe { CreatePipe(&mut read_h, &mut write_h, ptr::null(), 0) } == FALSE {
+    // 64 KB buffer — matches psmux; default (0) is ~4 KB which can
+    // stall ConPTY output on fast-producing child processes.
+    if unsafe { CreatePipe(&mut read_h, &mut write_h, ptr::null(), 64 * 1024) } == FALSE {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe {

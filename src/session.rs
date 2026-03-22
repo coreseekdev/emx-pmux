@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
+use crate::pmux_log;
 use crate::pty::{self, PtyChild, PtyConfig, PtyMaster, PtyReader, PtyResult, WindowSize};
 use crate::screen::Screen;
 
@@ -61,31 +62,36 @@ impl Session {
         let mut reader: PtyReader = match self.master.try_clone() {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[pmux] reader: try_clone failed: {}", e);
+                pmux_log!("reader: try_clone failed: {}", e);
                 return;
             }
         };
 
         let name = self.name.clone();
         thread::spawn(move || {
-            eprintln!("[pmux] reader({}): started", name);
+            pmux_log!("reader({}): started", name);
             let mut buf = [0u8; 8192];
             let mut total = 0usize;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        eprintln!("[pmux] reader({}): EOF after {} bytes", name, total);
+                        pmux_log!("reader({}): EOF after {} bytes", name, total);
                         break;
                     }
                     Ok(n) => {
                         total += n;
+                        if total <= 256 {
+                            pmux_log!("reader({}): read {} bytes (total {}), data={:02x?}", name, n, total, &buf[..n.min(64)]);
+                        } else {
+                            pmux_log!("reader({}): read {} bytes (total {})", name, n, total);
+                        }
                         if let Ok(mut scr) = screen.lock() {
                             scr.feed(&buf[..n]);
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        eprintln!("[pmux] reader({}): error after {} bytes: {}", name, total, e);
+                        pmux_log!("reader({}): error after {} bytes: {}", name, total, e);
                         break;
                     }
                 }

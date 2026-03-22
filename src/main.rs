@@ -2,6 +2,7 @@ use clap::Parser;
 use pmux::cli::{Args, Mode};
 use pmux::ipc::{self, Message};
 use pmux::platform;
+use pmux::pmux_log;
 use pmux::terminal;
 use std::process;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,11 +102,14 @@ async fn main() {
 
 /// Send a message to the daemon and return the response.
 async fn rpc(msg: &Message) -> Result<Message, String> {
+    pmux_log!("rpc: sending {:?}", msg);
     let stream =
         platform::connect_daemon().await.map_err(|e| format!("cannot connect to daemon: {}", e))?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     ipc::write_msg(&mut wr, msg).await.map_err(|e| format!("send failed: {}", e))?;
-    ipc::read_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
+    let resp = ipc::read_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))?;
+    pmux_log!("rpc: received {:?}", resp);
+    Ok(resp)
 }
 
 /// Create a new session (default mode).
@@ -182,7 +186,10 @@ async fn run_resume(args: &Args) -> Result<(), String> {
     // Verify session exists by fetching initial screen content.
     let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
     let initial = match resp {
-        Message::ScreenData { content } => content,
+        Message::ScreenData { content } => {
+            pmux_log!("resume: initial screen len={}", content.len());
+            content
+        }
         Message::Error { message } => return Err(message),
         _ => return Err("unexpected response".into()),
     };
@@ -267,6 +274,7 @@ async fn attach_loop(name: &str, initial: &str) -> Result<(), String> {
                 match rpc(&Message::ViewScreen { name: name.to_string() }).await {
                     Ok(Message::ScreenData { content }) => {
                         if content != last_content {
+                            pmux_log!("attach: screen changed, len={}", content.len());
                             render_screen(&mut stdout, &content).await?;
                             last_content = content;
                         }
