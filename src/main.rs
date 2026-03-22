@@ -51,20 +51,21 @@ fn unescape(s: &str) -> Vec<u8> {
     result
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
     let mode = args.mode();
 
     let result = match mode {
-        Mode::Daemon => pmux::daemon::run().map_err(|e| e.to_string()),
-        Mode::Create => run_create(&args),
-        Mode::List => run_list(),
-        Mode::View => run_view(&args),
-        Mode::Resume => run_resume(&args),
-        Mode::Exec => run_exec(&args),
+        Mode::Daemon => pmux::daemon::run().await.map_err(|e| e.to_string()),
+        Mode::Create => run_create(&args).await,
+        Mode::List => run_list().await,
+        Mode::View => run_view(&args).await,
+        Mode::Resume => run_resume(&args).await,
+        Mode::Exec => run_exec(&args).await,
         Mode::Status => run_status(),
-        Mode::Stop => run_stop(),
-        Mode::Ping => run_ping(),
+        Mode::Stop => run_stop().await,
+        Mode::Ping => run_ping().await,
     };
 
     if let Err(e) = result {
@@ -74,23 +75,24 @@ fn main() {
 }
 
 /// Send a request to the daemon and return the response.
-fn rpc(req: &Request) -> Result<Response, String> {
-    let mut stream =
-        platform::connect_daemon().map_err(|e| format!("cannot connect to daemon: {}", e))?;
-    ipc::send_msg(&mut stream, req).map_err(|e| format!("send failed: {}", e))?;
-    ipc::recv_msg(&mut stream).map_err(|e| format!("recv failed: {}", e))
+async fn rpc(req: &Request) -> Result<Response, String> {
+    let stream =
+        platform::connect_daemon().await.map_err(|e| format!("cannot connect to daemon: {}", e))?;
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    ipc::send_msg(&mut wr, req).await.map_err(|e| format!("send failed: {}", e))?;
+    ipc::recv_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
 }
 
 /// Create a new session (default mode).
-fn run_create(args: &Args) -> Result<(), String> {
+async fn run_create(args: &Args) -> Result<(), String> {
     // Ensure daemon is running (auto-start).
-    platform::ensure_daemon().map_err(|e| format!("failed to start daemon: {}", e))?;
+    platform::ensure_daemon().await.map_err(|e| format!("failed to start daemon: {}", e))?;
     let resp = rpc(&Request::NewSession {
         name: args.session.clone(),
         command: args.command.clone(),
         cols: args.width,
         rows: args.height,
-    })?;
+    }).await?;
     match resp {
         Response::Created { name } => {
             println!("{}", name);
@@ -102,8 +104,8 @@ fn run_create(args: &Args) -> Result<(), String> {
 }
 
 /// List sessions.
-fn run_list() -> Result<(), String> {
-    let resp = rpc(&Request::ListSessions)?;
+async fn run_list() -> Result<(), String> {
+    let resp = rpc(&Request::ListSessions).await?;
     match resp {
         Response::SessionList { sessions } => {
             if sessions.is_empty() {
@@ -122,11 +124,11 @@ fn run_list() -> Result<(), String> {
 }
 
 /// View/peek session screen buffer (non-interactive, unlike -r).
-fn run_view(args: &Args) -> Result<(), String> {
+async fn run_view(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
-    let resp = rpc(&Request::ViewScreen { name: name.clone() })?;
+    let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
     match resp {
         Response::Screen { content } => {
             println!("{}", content);
@@ -138,11 +140,11 @@ fn run_view(args: &Args) -> Result<(), String> {
 }
 
 /// Resume/attach to a session (interactive, for future implementation).
-fn run_resume(args: &Args) -> Result<(), String> {
+async fn run_resume(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
-    let resp = rpc(&Request::ViewScreen { name: name.clone() })?;
+    let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
     match resp {
         Response::Screen { content } => {
             println!("{}", content);
@@ -154,7 +156,7 @@ fn run_resume(args: &Args) -> Result<(), String> {
 }
 
 /// Execute command on running session (-X mode).
-fn run_exec(args: &Args) -> Result<(), String> {
+async fn run_exec(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
@@ -176,7 +178,7 @@ fn run_exec(args: &Args) -> Result<(), String> {
             let resp = rpc(&Request::SendData {
                 name: name.clone(),
                 data,
-            })?;
+            }).await?;
             match resp {
                 Response::Ok => Ok(()),
                 Response::Error { message } => Err(message),
@@ -195,7 +197,7 @@ fn run_exec(args: &Args) -> Result<(), String> {
                 name: name.clone(),
                 cols: width,
                 rows: height,
-            })?;
+            }).await?;
             match resp {
                 Response::Ok => Ok(()),
                 Response::Error { message } => Err(message),
@@ -203,7 +205,7 @@ fn run_exec(args: &Args) -> Result<(), String> {
             }
         }
         "view" => {
-            let resp = rpc(&Request::ViewScreen { name: name.clone() })?;
+            let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
             match resp {
                 Response::Screen { content } => {
                     println!("{}", content);
@@ -220,14 +222,12 @@ fn run_exec(args: &Args) -> Result<(), String> {
             } else {
                 "-".to_string()  // default to stdout
             };
-            let resp = rpc(&Request::ViewScreen { name: name.clone() })?;
+            let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
             match resp {
                 Response::Screen { content } => {
                     if file == "-" {
-                        // Output to stdout
                         println!("{}", content);
                     } else {
-                        // Write to file
                         std::fs::write(&file, content)
                             .map_err(|e| format!("failed to write hardcopy: {}", e))?;
                         eprintln!("hardcopy written to {}", file);
@@ -239,7 +239,7 @@ fn run_exec(args: &Args) -> Result<(), String> {
             }
         }
         "quit" => {
-            let resp = rpc(&Request::KillSession { name: name.clone() })?;
+            let resp = rpc(&Request::KillSession { name: name.clone() }).await?;
             match resp {
                 Response::Ok => Ok(()),
                 Response::Error { message } => Err(message),
@@ -262,8 +262,8 @@ fn run_status() -> Result<(), String> {
 }
 
 /// Stop the daemon.
-fn run_stop() -> Result<(), String> {
-    let resp = rpc(&Request::KillServer)?;
+async fn run_stop() -> Result<(), String> {
+    let resp = rpc(&Request::KillServer).await?;
     match resp {
         Response::Ok => {
             println!("daemon stopped");
@@ -275,8 +275,8 @@ fn run_stop() -> Result<(), String> {
 }
 
 /// Ping the daemon.
-fn run_ping() -> Result<(), String> {
-    let resp = rpc(&Request::Ping)?;
+async fn run_ping() -> Result<(), String> {
+    let resp = rpc(&Request::Ping).await?;
     match resp {
         Response::Pong => {
             println!("pong");

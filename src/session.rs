@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
@@ -17,8 +18,7 @@ pub struct Session {
     master: PtyMaster,
     child: PtyChild,
     screen: Arc<Mutex<Screen>>,
-    /// Flag: reader thread should stop when child exits.
-    alive: Arc<Mutex<bool>>,
+    alive: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -29,7 +29,7 @@ impl Session {
         let (master, child) = pty::spawn(&config)?;
 
         let screen = Arc::new(Mutex::new(Screen::new(size.cols, size.rows)));
-        let alive = Arc::new(Mutex::new(true));
+        let alive = Arc::new(AtomicBool::new(true));
 
         let created_at = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -51,12 +51,13 @@ impl Session {
     }
 
     /// Start background reader thread that feeds PTY output into Screen.
+    ///
+    /// PTY reads are inherently blocking I/O (file descriptor / HANDLE),
+    /// so we keep a real OS thread here rather than a tokio task.
     fn start_reader(&mut self) {
         let screen = Arc::clone(&self.screen);
         let alive = Arc::clone(&self.alive);
 
-        // Get a read-only handle for the background thread.
-        // PtyReader does NOT own the HPCON / master, so dropping it is safe.
         let mut reader: PtyReader = match self.master.try_clone() {
             Ok(r) => r,
             Err(_) => return,
@@ -76,9 +77,7 @@ impl Session {
                     Err(_) => break,
                 }
             }
-            if let Ok(mut a) = alive.lock() {
-                *a = false;
-            }
+            alive.store(false, Ordering::SeqCst);
         });
     }
 
@@ -106,7 +105,7 @@ impl Session {
 
     /// Check if the child process is still alive.
     pub fn is_alive(&self) -> bool {
-        *self.alive.lock().unwrap()
+        self.alive.load(Ordering::SeqCst)
     }
 
     /// Kill the child process.

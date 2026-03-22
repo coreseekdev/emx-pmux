@@ -1,86 +1,129 @@
-//! Daemon: listens for IPC requests and manages sessions.
+//! Daemon: async event loop that manages sessions via IPC.
 //!
-//! Auto-exits when all sessions have ended.
+//! Uses `tokio::select!` for multiplexing accept, shutdown signals,
+//! and periodic dead-session reaping. Auto-exits when all sessions
+//! have ended (after at least one was created).
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
-use interprocess::local_socket::traits::Listener;
 
 use crate::ipc::{self, Request, Response};
 use crate::platform;
 use crate::session::SessionManager;
 
-/// Run the daemon main loop. This function does not return until the
-/// daemon is asked to shut down or all sessions exit.
-pub fn run() -> io::Result<()> {
+/// Run the daemon main loop (async). Does not return until shutdown.
+pub async fn run() -> io::Result<()> {
     platform::write_pid_file()?;
-
-    let listener = platform::create_listener()?;
-    // Use a non-blocking accept with a short timeout so we can
-    // periodically reap dead sessions.
-    listener.set_nonblocking(interprocess::local_socket::ListenerNonblockingMode::Accept)?;
-
     let mut mgr = SessionManager::new();
-    let shutdown = Arc::new(AtomicBool::new(false));
     let mut had_sessions = false;
+    let mut reap_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
-    // Ctrl-C handler (best-effort)
+    #[cfg(unix)]
     {
-        let shutdown = Arc::clone(&shutdown);
-        let _ = ctrlc_set(move || shutdown.store(true, Ordering::SeqCst));
+        run_unix(&mut mgr, &mut had_sessions, &mut reap_interval).await?;
     }
-
-    while !shutdown.load(Ordering::SeqCst) {
-        // Accept one connection (non-blocking).
-        match listener.accept() {
-            Ok(mut stream) => {
-                if let Some(true) = handle_one(&mut stream, &mut mgr, &shutdown) {
-                    // KillServer was requested.
-                    break;
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock
-                || e.kind() == io::ErrorKind::TimedOut => {
-                // No incoming connection this tick.
-            }
-            Err(_) => {
-                // Transient accept error – ignore.
-            }
-        }
-
-        // Reap dead sessions.
-        mgr.reap_dead();
-
-        // Auto-exit when all sessions have ended (and we had at least one).
-        if had_sessions && mgr.count() == 0 {
-            break;
-        }
-        if mgr.count() > 0 {
-            had_sessions = true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    #[cfg(windows)]
+    {
+        run_windows(&mut mgr, &mut had_sessions, &mut reap_interval).await?;
     }
 
     platform::remove_pid_file();
     Ok(())
 }
 
-/// Handle a single client connection. Returns `Some(true)` if KillServer.
-fn handle_one(
-    stream: &mut interprocess::local_socket::Stream,
+// ── Unix (UnixListener) ─────────────────────────────────────────────
+
+#[cfg(unix)]
+async fn run_unix(
     mgr: &mut SessionManager,
-    _shutdown: &Arc<AtomicBool>,
-) -> Option<bool> {
-    let req: Request = match ipc::recv_msg(stream) {
+    had_sessions: &mut bool,
+    reap_interval: &mut tokio::time::Interval,
+) -> io::Result<()> {
+    let listener = platform::create_listener().await?;
+
+    // Ignore SIGINT in daemon – exit via KillServer or auto-exit.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN); }
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _addr)) => {
+                        let (mut rd, mut wr) = tokio::io::split(stream);
+                        if let Some(true) = handle_one(&mut rd, &mut wr, mgr).await {
+                            break;
+                        }
+                    }
+                    Err(_) => {} // transient accept error
+                }
+            }
+            _ = reap_interval.tick() => {
+                mgr.reap_dead();
+                if *had_sessions && mgr.count() == 0 {
+                    break;
+                }
+                if mgr.count() > 0 {
+                    *had_sessions = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Windows (NamedPipe) ──────────────────────────────────────────────
+
+#[cfg(windows)]
+async fn run_windows(
+    mgr: &mut SessionManager,
+    had_sessions: &mut bool,
+    reap_interval: &mut tokio::time::Interval,
+) -> io::Result<()> {
+    let mut pipe = platform::create_pipe_instance()?;
+
+    loop {
+        tokio::select! {
+            result = pipe.connect() => {
+                if result.is_ok() {
+                    let (mut rd, mut wr) = tokio::io::split(pipe);
+                    let kill = handle_one(&mut rd, &mut wr, mgr).await;
+                    // Create a fresh pipe instance for the next client.
+                    pipe = platform::create_next_pipe_instance()?;
+                    if kill == Some(true) {
+                        break;
+                    }
+                } else {
+                    pipe = platform::create_next_pipe_instance()?;
+                }
+            }
+            _ = reap_interval.tick() => {
+                mgr.reap_dead();
+                if *had_sessions && mgr.count() == 0 {
+                    break;
+                }
+                if mgr.count() > 0 {
+                    *had_sessions = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Request handling ─────────────────────────────────────────────────
+
+/// Handle a single client request. Returns `Some(true)` on KillServer.
+async fn handle_one<R, W>(rd: &mut R, wr: &mut W, mgr: &mut SessionManager) -> Option<bool>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let req: Request = match ipc::recv_msg(rd).await {
         Ok(r) => r,
         Err(_) => return None,
     };
 
     let (resp, kill) = dispatch(req, mgr);
-    let _ = ipc::send_msg(stream, &resp);
+    let _ = ipc::send_msg(wr, &resp).await;
     Some(kill)
 }
 
@@ -126,44 +169,4 @@ fn dispatch(req: Request, mgr: &mut SessionManager) -> (Response, bool) {
 
         Request::Ping => (Response::Pong, false),
     }
-}
-
-// ── Ctrl-C helper ────────────────────────────────────────────────────
-
-#[cfg(unix)]
-fn ctrlc_set(f: impl Fn() + Send + 'static) -> io::Result<()> {
-    // Use a simple signal handler via libc.
-    // For simplicity, we just ignore SIGINT in the daemon –
-    // the daemon exits when sessions are gone or KillServer is sent.
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_IGN);
-    }
-    let _ = f; // unused on this path but keeps the signature consistent
-    Ok(())
-}
-
-#[cfg(windows)]
-fn ctrlc_set(f: impl Fn() + Send + Sync + 'static) -> io::Result<()> {
-    use std::sync::OnceLock;
-    static HANDLER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
-    HANDLER.get_or_init(|| {
-        let f = f;
-        Box::new(move || f())
-    });
-
-    unsafe extern "system" fn handler(_: u32) -> i32 {
-        if let Some(f) = HANDLER.get() {
-            f();
-        }
-        1 // TRUE – handled
-    }
-
-    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-    // SAFETY: handler follows the required signature.
-    unsafe {
-        if SetConsoleCtrlHandler(Some(handler), 1) == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
