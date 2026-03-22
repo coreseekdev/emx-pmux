@@ -6,7 +6,7 @@
 
 use std::io;
 
-use crate::ipc::{self, Request, Response};
+use crate::ipc::{self, Message};
 use crate::platform;
 use crate::session::SessionManager;
 
@@ -132,56 +132,59 @@ where
         return None;
     }
 
-    let req: Request = match ipc::recv_msg(rd).await {
-        Ok(r) => r,
+    let msg: Message = match ipc::read_msg(rd).await {
+        Ok(m) => m,
         Err(_) => return None,
     };
 
-    let (resp, kill) = dispatch(req, mgr);
-    let _ = ipc::send_msg(wr, &resp).await;
+    let (resp, kill) = dispatch(msg, mgr);
+    let _ = ipc::write_msg(wr, &resp).await;
     Some(kill)
 }
 
-/// Dispatch a request, returning (response, should_kill_server).
-fn dispatch(req: Request, mgr: &mut SessionManager) -> (Response, bool) {
-    match req {
-        Request::NewSession {
+/// Dispatch a message, returning (response, should_kill_server).
+fn dispatch(msg: Message, mgr: &mut SessionManager) -> (Message, bool) {
+    match msg {
+        Message::NewSession {
             name,
             command,
             cols,
             rows,
         } => match mgr.create(name, command, cols, rows) {
-            Ok(n) => (Response::Created { name: n }, false),
-            Err(e) => (Response::Error { message: e }, false),
+            Ok(n) => (Message::Created { name: n }, false),
+            Err(e) => (Message::Error { message: e }, false),
         },
 
-        Request::KillSession { name } => match mgr.kill(&name) {
-            Ok(()) => (Response::Ok, false),
-            Err(e) => (Response::Error { message: e }, false),
+        Message::KillSession { name } => match mgr.kill(&name) {
+            Ok(()) => (Message::Ok, false),
+            Err(e) => (Message::Error { message: e }, false),
         },
 
-        Request::ListSessions => {
+        Message::ListSessions => {
             let sessions = mgr.list();
-            (Response::SessionList { sessions }, false)
+            (Message::SessionList { sessions }, false)
         }
 
-        Request::SendData { name, data } => match mgr.send(&name, &data) {
-            Ok(()) => (Response::Ok, false),
-            Err(e) => (Response::Error { message: e }, false),
+        Message::SendData { name, data } => match mgr.send(&name, &data) {
+            Ok(()) => (Message::Ok, false),
+            Err(e) => (Message::Error { message: e }, false),
         },
 
-        Request::ViewScreen { name } => match mgr.view(&name) {
-            Ok(content) => (Response::Screen { content }, false),
-            Err(e) => (Response::Error { message: e }, false),
+        Message::ViewScreen { name } => match mgr.view(&name) {
+            Ok(content) => (Message::ScreenData { content }, false),
+            Err(e) => (Message::Error { message: e }, false),
         },
 
-        Request::ResizePty { name, cols, rows } => match mgr.resize(&name, cols, rows) {
-            Ok(()) => (Response::Ok, false),
-            Err(e) => (Response::Error { message: e }, false),
+        Message::ResizePty { name, cols, rows } => match mgr.resize(&name, cols, rows) {
+            Ok(()) => (Message::Ok, false),
+            Err(e) => (Message::Error { message: e }, false),
         },
 
-        Request::KillServer => (Response::Ok, true),
+        Message::KillServer => (Message::Ok, true),
 
-        Request::Ping => (Response::Pong, false),
+        Message::Ping => (Message::Pong, false),
+
+        // Response messages should not arrive from clients — ignore them.
+        _ => (Message::Error { message: "unexpected message".into() }, false),
     }
 }

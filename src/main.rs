@@ -1,6 +1,6 @@
 use clap::Parser;
 use pmux::cli::{Args, Mode};
-use pmux::ipc::{self, Request, Response};
+use pmux::ipc::{self, Message};
 use pmux::platform;
 use std::process;
 
@@ -97,41 +97,41 @@ async fn main() {
     }
 }
 
-/// Send a request to the daemon and return the response.
-async fn rpc(req: &Request) -> Result<Response, String> {
+/// Send a message to the daemon and return the response.
+async fn rpc(msg: &Message) -> Result<Message, String> {
     let stream =
         platform::connect_daemon().await.map_err(|e| format!("cannot connect to daemon: {}", e))?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     ipc::write_handshake(&mut wr).await.map_err(|e| format!("handshake failed: {}", e))?;
-    ipc::send_msg(&mut wr, req).await.map_err(|e| format!("send failed: {}", e))?;
-    ipc::recv_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
+    ipc::write_msg(&mut wr, msg).await.map_err(|e| format!("send failed: {}", e))?;
+    ipc::read_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
 }
 
 /// Create a new session (default mode).
 async fn run_create(args: &Args) -> Result<(), String> {
     // Ensure daemon is running (auto-start).
     platform::ensure_daemon().await.map_err(|e| format!("failed to start daemon: {}", e))?;
-    let resp = rpc(&Request::NewSession {
+    let resp = rpc(&Message::NewSession {
         name: args.session.clone(),
         command: args.command.clone(),
         cols: args.width,
         rows: args.height,
     }).await?;
     match resp {
-        Response::Created { name } => {
+        Message::Created { name } => {
             println!("{}", name);
             Ok(())
         }
-        Response::Error { message } => Err(message),
+        Message::Error { message } => Err(message),
         _ => Err("unexpected response".into()),
     }
 }
 
 /// List sessions.
 async fn run_list() -> Result<(), String> {
-    let resp = rpc(&Request::ListSessions).await?;
+    let resp = rpc(&Message::ListSessions).await?;
     match resp {
-        Response::SessionList { sessions } => {
+        Message::SessionList { sessions } => {
             if sessions.is_empty() {
                 println!("No sessions");
             } else {
@@ -142,7 +142,7 @@ async fn run_list() -> Result<(), String> {
             }
             Ok(())
         }
-        Response::Error { message } => Err(message),
+        Message::Error { message } => Err(message),
         _ => Err("unexpected response".into()),
     }
 }
@@ -152,13 +152,13 @@ async fn run_view(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
-    let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
+    let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
     match resp {
-        Response::Screen { content } => {
+        Message::ScreenData { content } => {
             println!("{}", content);
             Ok(())
         }
-        Response::Error { message } => Err(message),
+        Message::Error { message } => Err(message),
         _ => Err("unexpected response".into()),
     }
 }
@@ -168,13 +168,13 @@ async fn run_resume(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
-    let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
+    let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
     match resp {
-        Response::Screen { content } => {
+        Message::ScreenData { content } => {
             println!("{}", content);
             Ok(())
         }
-        Response::Error { message } => Err(message),
+        Message::Error { message } => Err(message),
         _ => Err("unexpected response".into()),
     }
 }
@@ -199,13 +199,13 @@ async fn run_exec(args: &Args) -> Result<(), String> {
             }
             let text = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
             let data = unescape(&text);
-            let resp = rpc(&Request::SendData {
+            let resp = rpc(&Message::SendData {
                 name: name.clone(),
                 data,
             }).await?;
             match resp {
-                Response::Ok => Ok(()),
-                Response::Error { message } => Err(message),
+                Message::Ok => Ok(()),
+                Message::Error { message } => Err(message),
                 _ => Err("unexpected response".into()),
             }
         }
@@ -217,25 +217,25 @@ async fn run_exec(args: &Args) -> Result<(), String> {
                 .map_err(|_| "invalid width".to_string())?;
             let height = cmd_args[1].parse::<u16>()
                 .map_err(|_| "invalid height".to_string())?;
-            let resp = rpc(&Request::ResizePty {
+            let resp = rpc(&Message::ResizePty {
                 name: name.clone(),
                 cols: width,
                 rows: height,
             }).await?;
             match resp {
-                Response::Ok => Ok(()),
-                Response::Error { message } => Err(message),
+                Message::Ok => Ok(()),
+                Message::Error { message } => Err(message),
                 _ => Err("unexpected response".into()),
             }
         }
         "view" => {
-            let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
+            let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
             match resp {
-                Response::Screen { content } => {
+                Message::ScreenData { content } => {
                     println!("{}", content);
                     Ok(())
                 }
-                Response::Error { message } => Err(message),
+                Message::Error { message } => Err(message),
                 _ => Err("unexpected response".into()),
             }
         }
@@ -246,9 +246,9 @@ async fn run_exec(args: &Args) -> Result<(), String> {
             } else {
                 "-".to_string()  // default to stdout
             };
-            let resp = rpc(&Request::ViewScreen { name: name.clone() }).await?;
+            let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
             match resp {
-                Response::Screen { content } => {
+                Message::ScreenData { content } => {
                     if file == "-" {
                         println!("{}", content);
                     } else {
@@ -258,15 +258,15 @@ async fn run_exec(args: &Args) -> Result<(), String> {
                     }
                     Ok(())
                 }
-                Response::Error { message } => Err(message),
+                Message::Error { message } => Err(message),
                 _ => Err("unexpected response".into()),
             }
         }
         "quit" => {
-            let resp = rpc(&Request::KillSession { name: name.clone() }).await?;
+            let resp = rpc(&Message::KillSession { name: name.clone() }).await?;
             match resp {
-                Response::Ok => Ok(()),
-                Response::Error { message } => Err(message),
+                Message::Ok => Ok(()),
+                Message::Error { message } => Err(message),
                 _ => Err("unexpected response".into()),
             }
         }
@@ -287,22 +287,22 @@ fn run_status() -> Result<(), String> {
 
 /// Stop the daemon.
 async fn run_stop() -> Result<(), String> {
-    let resp = rpc(&Request::KillServer).await?;
+    let resp = rpc(&Message::KillServer).await?;
     match resp {
-        Response::Ok => {
+        Message::Ok => {
             println!("daemon stopped");
             Ok(())
         }
-        Response::Error { message } => Err(message),
+        Message::Error { message } => Err(message),
         _ => Err("unexpected response".into()),
     }
 }
 
 /// Ping the daemon.
 async fn run_ping() -> Result<(), String> {
-    let resp = rpc(&Request::Ping).await?;
+    let resp = rpc(&Message::Ping).await?;
     match resp {
-        Response::Pong => {
+        Message::Pong => {
             println!("pong");
             Ok(())
         }
