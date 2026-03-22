@@ -1,6 +1,6 @@
 # emx-pmux 当前限制与局限
 
-v0.4.0 — IPC 协议重构为二进制分帧（参考 tmux imsgbuf），统一 Message 类型。
+v0.4.0 — IPC 协议重构为 Screen 兼容二进制分帧，MSG_* 常量与 Screen 一致，纯二进制编码（移除 JSON）。
 
 ---
 
@@ -53,10 +53,11 @@ v0.4.0 — IPC 协议重构为二进制分帧（参考 tmux imsgbuf），统一 
 
 ## 三、IPC 层限制
 
-### ~~8. 无协议版本化~~ ✅ 已解决 (v0.3.0)
+### ~~8. 无协议版本化~~ ✅ 已解决 (v0.3.0→v0.4.0 增强)
 - ~~请求/响应结构变更时旧客户端与新守护进程不兼容~~
-- **现状**: IPC 连接开头发送 magic `PMUX` + 2-byte 版本号，daemon 校验后处理
-- 版本不匹配时返回明确错误信息
+- **v0.3.0**: IPC 连接开头发送 magic `PMUX` + 2-byte 版本号
+- **v0.4.0**: 每条消息内嵌 Screen 风格 revision magic (`0x706d7801`)，无需独立握手
+- 版本不匹配时返回明确错误信息（含期望值与实际值的十六进制）
 
 ### 9. 无身份验证
 - 任何能连接到命名管道/socket 的进程都可控制 daemon
@@ -152,9 +153,14 @@ v0.4.0 — IPC 协议重构为二进制分帧（参考 tmux imsgbuf），统一 
 ### ~~21. IPC JSON 序列化开销~~ ✅ 已解决 (v0.4.0)
 - ~~每次 RPC 都做 JSON 序列化/反序列化~~
 - ~~SendData 将 `Vec<u8>` 序列化为 JSON 数组（每字节一个数字）~~
-- **现状**: IPC 重构为二进制分帧协议（type:u16 + len:u32 + payload）
-  - 结构化消息仍用 JSON payload（可调试、可扩展）
-  - SendData 使用二进制编码（name_len + name + raw_bytes），零膨胀
-  - ScreenData 使用 raw UTF-8，无 JSON 字符串转义开销
-  - Request/Response 合并为统一 Message 枚举（参考 tmux MSG_* 设计）
-  - 消息类型 ID 预留了 ATTACH/DETACH/EXPECT/READ 用于 expect 接管
+- **现状**: IPC 重构为 Screen 兼容的纯二进制协议（`serde_json` 依赖已移除）
+  - **12 字节 LE 头**: `protocol_revision` (i32) + `type` (i32) + `payload_len` (u32)
+  - **Screen 兼容 magic**: `PROTOCOL_REVISION = ('p'<<24)|('m'<<16)|('x'<<8)|1` = `0x706d7801`
+    （遵循 Screen 的 `('m'<<24)|('s'<<16)|('g'<<8)|4` 模式）
+  - **MSG_* 常量 0–9 与 Screen 完全一致**: CREATE=0, ERROR=1, ATTACH=2, CONT=3, DETACH=4, POW_DETACH=5, WINCH=6, HANGUP=7, COMMAND=8, QUERY=9
+  - **pmux 扩展 ≥100**: SEND_DATA=100, VIEW_SCREEN=101, RESIZE_PTY=102, KILL_SERVER=103, PING=104, LIST_SESSIONS=105
+  - **响应类型 ≥200**: OK=200, CREATED=201, SESSION_LIST=202, SCREEN_DATA=203, PONG=204
+  - **保留 ≥300**: 用于未来 expect-takeover API
+  - 字符串用 u16-LE 前缀 + UTF-8，可选字符串用 0xFFFF 哨兵表示 None
+  - 每条消息内嵌 revision magic，无需独立握手
+  - MSG_COMMAND 支持 Screen 风格的 `-X` 命令分发

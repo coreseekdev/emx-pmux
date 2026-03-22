@@ -102,7 +102,6 @@ async fn rpc(msg: &Message) -> Result<Message, String> {
     let stream =
         platform::connect_daemon().await.map_err(|e| format!("cannot connect to daemon: {}", e))?;
     let (mut rd, mut wr) = tokio::io::split(stream);
-    ipc::write_handshake(&mut wr).await.map_err(|e| format!("handshake failed: {}", e))?;
     ipc::write_msg(&mut wr, msg).await.map_err(|e| format!("send failed: {}", e))?;
     ipc::read_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
 }
@@ -111,7 +110,7 @@ async fn rpc(msg: &Message) -> Result<Message, String> {
 async fn run_create(args: &Args) -> Result<(), String> {
     // Ensure daemon is running (auto-start).
     platform::ensure_daemon().await.map_err(|e| format!("failed to start daemon: {}", e))?;
-    let resp = rpc(&Message::NewSession {
+    let resp = rpc(&Message::Create {
         name: args.session.clone(),
         command: args.command.clone(),
         cols: args.width,
@@ -180,6 +179,9 @@ async fn run_resume(args: &Args) -> Result<(), String> {
 }
 
 /// Execute command on running session (-X mode).
+///
+/// Uses MSG_COMMAND (Screen-compatible) for most commands.
+/// `stuff` with escape sequences uses MSG_SEND_DATA for raw binary.
 async fn run_exec(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
@@ -189,88 +191,70 @@ async fn run_exec(args: &Args) -> Result<(), String> {
         return Err("command required (e.g., stuff, resize, view, hardcopy, quit)".into());
     }
 
-    let cmd = args.command_args[0].clone();
-    let cmd_args: Vec<&String> = args.command_args.iter().skip(1).collect();
+    let cmd = &args.command_args[0];
 
-    match cmd.as_str() {
-        "stuff" => {
-            if cmd_args.is_empty() {
-                return Err("stuff requires text argument".into());
-            }
-            let text = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
-            let data = unescape(&text);
-            let resp = rpc(&Message::SendData {
-                name: name.clone(),
-                data,
-            }).await?;
-            match resp {
-                Message::Ok => Ok(()),
-                Message::Error { message } => Err(message),
-                _ => Err("unexpected response".into()),
-            }
+    // Special case: `stuff` with escape processing uses MSG_SEND_DATA
+    // so that raw binary (including NUL, ESC) reaches the PTY correctly.
+    if cmd == "stuff" {
+        let cmd_args: Vec<&str> = args.command_args[1..].iter().map(|s| s.as_str()).collect();
+        if cmd_args.is_empty() {
+            return Err("stuff requires text argument".into());
         }
-        "resize" => {
-            if cmd_args.len() != 2 {
-                return Err("resize requires width and height (e.g., resize 80 24)".into());
-            }
-            let width = cmd_args[0].parse::<u16>()
-                .map_err(|_| "invalid width".to_string())?;
-            let height = cmd_args[1].parse::<u16>()
-                .map_err(|_| "invalid height".to_string())?;
-            let resp = rpc(&Message::ResizePty {
-                name: name.clone(),
-                cols: width,
-                rows: height,
-            }).await?;
-            match resp {
-                Message::Ok => Ok(()),
-                Message::Error { message } => Err(message),
-                _ => Err("unexpected response".into()),
-            }
-        }
-        "view" => {
-            let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
-            match resp {
-                Message::ScreenData { content } => {
+        let text = cmd_args.join(" ");
+        let data = unescape(&text);
+        let resp = rpc(&Message::SendData {
+            name: name.clone(),
+            data,
+        }).await?;
+        return match resp {
+            Message::Ok => Ok(()),
+            Message::Error { message } => Err(message),
+            _ => Err("unexpected response".into()),
+        };
+    }
+
+    // Special case: `hardcopy` with file argument needs client-side file write
+    if cmd == "hardcopy" {
+        let file = if args.command_args.len() > 1 {
+            args.command_args[1].clone()
+        } else {
+            "-".to_string()
+        };
+        // Use MSG_COMMAND to get screen content
+        let resp = rpc(&Message::Command {
+            name: name.clone(),
+            args: vec!["view".into()],
+        }).await?;
+        return match resp {
+            Message::ScreenData { content } => {
+                if file == "-" {
                     println!("{}", content);
-                    Ok(())
+                } else {
+                    std::fs::write(&file, &content)
+                        .map_err(|e| format!("failed to write hardcopy: {}", e))?;
+                    eprintln!("hardcopy written to {}", file);
                 }
-                Message::Error { message } => Err(message),
-                _ => Err("unexpected response".into()),
+                Ok(())
             }
+            Message::Error { message } => Err(message),
+            _ => Err("unexpected response".into()),
+        };
+    }
+
+    // All other commands: send as MSG_COMMAND (Screen-compatible)
+    let resp = rpc(&Message::Command {
+        name: name.clone(),
+        args: args.command_args.clone(),
+    }).await?;
+
+    match resp {
+        Message::Ok => Ok(()),
+        Message::ScreenData { content } => {
+            println!("{}", content);
+            Ok(())
         }
-        "hardcopy" => {
-            // hardcopy [file] - if file is "-", output to stdout
-            let file = if !cmd_args.is_empty() {
-                cmd_args[0].clone()
-            } else {
-                "-".to_string()  // default to stdout
-            };
-            let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
-            match resp {
-                Message::ScreenData { content } => {
-                    if file == "-" {
-                        println!("{}", content);
-                    } else {
-                        std::fs::write(&file, content)
-                            .map_err(|e| format!("failed to write hardcopy: {}", e))?;
-                        eprintln!("hardcopy written to {}", file);
-                    }
-                    Ok(())
-                }
-                Message::Error { message } => Err(message),
-                _ => Err("unexpected response".into()),
-            }
-        }
-        "quit" => {
-            let resp = rpc(&Message::KillSession { name: name.clone() }).await?;
-            match resp {
-                Message::Ok => Ok(()),
-                Message::Error { message } => Err(message),
-                _ => Err("unexpected response".into()),
-            }
-        }
-        _ => Err(format!("unknown command: {}", cmd)),
+        Message::Error { message } => Err(message),
+        _ => Err("unexpected response".into()),
     }
 }
 
