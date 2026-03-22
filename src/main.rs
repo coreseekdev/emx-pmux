@@ -2,7 +2,9 @@ use clap::Parser;
 use pmux::cli::{Args, Mode};
 use pmux::ipc::{self, Message};
 use pmux::platform;
+use pmux::terminal;
 use std::process;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Parse C-style escape sequences in a string (\n, \r, \t, \\, \e, \xHH, \uXXXX).
 fn unescape(s: &str) -> Vec<u8> {
@@ -162,20 +164,143 @@ async fn run_view(args: &Args) -> Result<(), String> {
     }
 }
 
-/// Resume/attach to a session (interactive, for future implementation).
+/// Resume/attach to a session (interactive terminal).
+///
+/// Enters terminal raw mode and runs a bidirectional loop:
+/// - stdin keystrokes are forwarded to the PTY via MSG_SEND_DATA
+/// - screen content is polled and rendered to stdout
+/// - Ctrl-A then 'd' detaches (Screen-compatible)
 async fn run_resume(args: &Args) -> Result<(), String> {
     let name = args.session
         .as_ref()
         .ok_or_else(|| "session name required (use -S)".to_string())?;
+
+    // Ensure daemon is running.
+    platform::ensure_daemon().await
+        .map_err(|e| format!("failed to start daemon: {}", e))?;
+
+    // Verify session exists by fetching initial screen content.
     let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
-    match resp {
-        Message::ScreenData { content } => {
-            println!("{}", content);
-            Ok(())
-        }
-        Message::Error { message } => Err(message),
-        _ => Err("unexpected response".into()),
+    let initial = match resp {
+        Message::ScreenData { content } => content,
+        Message::Error { message } => return Err(message),
+        _ => return Err("unexpected response".into()),
+    };
+
+    // Enter raw mode.
+    let saved = terminal::enable_raw_mode()
+        .map_err(|e| format!("failed to enable raw mode: {}", e))?;
+
+    let result = attach_loop(name, &initial).await;
+
+    // Always restore terminal state.
+    let _ = terminal::disable_raw_mode(&saved);
+
+    // Print detach/exit message on a clean line.
+    match &result {
+        Ok(()) => eprintln!("\r\n[detached from session {}]", name),
+        Err(e) => eprintln!("\r\n[session {}: {}]", name, e),
     }
+    result
+}
+
+/// Main attach loop: forward stdin → PTY, poll screen → stdout.
+async fn attach_loop(name: &str, initial: &str) -> Result<(), String> {
+    let mut stdout = tokio::io::stdout();
+
+    // Clear screen and render initial content.
+    render_screen(&mut stdout, initial).await?;
+
+    let mut last_content = initial.to_string();
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 1024];
+    let mut ctrl_a_pending = false;
+
+    let mut refresh = tokio::time::interval(std::time::Duration::from_millis(33));
+    // Don't let missed ticks pile up.
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased; // Prioritize user input over refresh
+
+            result = stdin.read(&mut buf) => {
+                let n = result.map_err(|e| format!("stdin read: {}", e))?;
+                if n == 0 {
+                    return Ok(()); // EOF on stdin
+                }
+
+                let mut to_send = Vec::with_capacity(n);
+                for &b in &buf[..n] {
+                    if ctrl_a_pending {
+                        ctrl_a_pending = false;
+                        match b {
+                            b'd' => return Ok(()), // Ctrl-A d = detach
+                            0x01 => to_send.push(0x01), // Ctrl-A Ctrl-A = literal Ctrl-A
+                            other => {
+                                // Not a recognized escape — send the Ctrl-A and this byte
+                                to_send.push(0x01);
+                                to_send.push(other);
+                            }
+                        }
+                    } else if b == 0x01 {
+                        ctrl_a_pending = true;
+                    } else {
+                        to_send.push(b);
+                    }
+                }
+
+                if !to_send.is_empty() {
+                    match rpc(&Message::SendData {
+                        name: name.to_string(),
+                        data: to_send,
+                    }).await {
+                        Ok(Message::Ok) => {}
+                        Ok(Message::Error { message }) => return Err(message),
+                        Err(e) => return Err(e),
+                        _ => {}
+                    }
+                }
+            }
+
+            _ = refresh.tick() => {
+                match rpc(&Message::ViewScreen { name: name.to_string() }).await {
+                    Ok(Message::ScreenData { content }) => {
+                        if content != last_content {
+                            render_screen(&mut stdout, &content).await?;
+                            last_content = content;
+                        }
+                    }
+                    Ok(Message::Error { message }) => {
+                        // Session likely died
+                        return Err(message);
+                    }
+                    Err(_) => {
+                        // Daemon connection lost
+                        return Err("lost connection to daemon".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Render screen content to stdout using ANSI positioning.
+async fn render_screen(stdout: &mut tokio::io::Stdout, content: &str) -> Result<(), String> {
+    let mut buf = Vec::with_capacity(content.len() + 256);
+    buf.extend_from_slice(b"\x1b[H"); // cursor home
+    for (i, line) in content.split('\n').enumerate() {
+        if i > 0 {
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf.extend_from_slice(line.as_bytes());
+        buf.extend_from_slice(b"\x1b[K"); // clear to end of line
+    }
+    buf.extend_from_slice(b"\x1b[J"); // clear below
+    stdout.write_all(&buf).await.map_err(|e| format!("write: {}", e))?;
+    stdout.flush().await.map_err(|e| format!("flush: {}", e))?;
+    Ok(())
 }
 
 /// Execute command on running session (-X mode).

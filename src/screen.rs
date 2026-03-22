@@ -223,6 +223,7 @@ impl Screen {
         self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
+        self.scroll_top = 0;
         self.scroll_bottom = rows.saturating_sub(1);
         if self.cursor_x >= cols {
             self.cursor_x = cols.saturating_sub(1);
@@ -286,8 +287,10 @@ impl<'a> ScreenPerformer<'a> {
     }
 
     fn scroll_up(&mut self, n: u16) {
-        let top = *self.scroll_top as usize;
-        let bottom = *self.scroll_bottom as usize;
+        self.scroll_up_region(*self.scroll_top as usize, *self.scroll_bottom as usize, n);
+    }
+
+    fn scroll_up_region(&mut self, top: usize, bottom: usize, n: u16) {
         let cols = self.cols as usize;
         let n = n as usize;
 
@@ -315,8 +318,10 @@ impl<'a> ScreenPerformer<'a> {
     }
 
     fn scroll_down(&mut self, n: u16) {
-        let top = *self.scroll_top as usize;
-        let bottom = *self.scroll_bottom as usize;
+        self.scroll_down_region(*self.scroll_top as usize, *self.scroll_bottom as usize, n);
+    }
+
+    fn scroll_down_region(&mut self, top: usize, bottom: usize, n: u16) {
         let cols = self.cols as usize;
         let n = n as usize;
 
@@ -616,14 +621,22 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 self.erase_in_line(p(0, 0));
             }
             'L' => {
-                // Insert Lines
+                // Insert Lines: push lines down from cursor_y within scroll region
                 let n = p(0, 1);
-                self.scroll_down(n);
+                self.scroll_down_region(
+                    *self.cursor_y as usize,
+                    *self.scroll_bottom as usize,
+                    n,
+                );
             }
             'M' => {
-                // Delete Lines
+                // Delete Lines: pull lines up from cursor_y within scroll region
                 let n = p(0, 1);
-                self.scroll_up(n);
+                self.scroll_up_region(
+                    *self.cursor_y as usize,
+                    *self.scroll_bottom as usize,
+                    n,
+                );
             }
             'S' => {
                 // Scroll Up
@@ -650,8 +663,9 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 let bottom = p(1, self.rows);
                 *self.scroll_top = top.saturating_sub(1);
                 *self.scroll_bottom = (bottom.saturating_sub(1)).min(self.rows.saturating_sub(1));
+                // DEC spec: cursor moves to home position (0,0), not scroll_top
                 *self.cursor_x = 0;
-                *self.cursor_y = *self.scroll_top;
+                *self.cursor_y = 0;
             }
             'P' => {
                 // Delete Characters

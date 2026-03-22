@@ -52,7 +52,19 @@ pub async fn connect_daemon() -> io::Result<tokio::net::UnixStream> {
 #[cfg(windows)]
 pub async fn connect_daemon() -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     let path = socket_path();
-    tokio::net::windows::named_pipe::ClientOptions::new().open(&path)
+    // Retry on ERROR_PIPE_BUSY (231): the daemon is between creating
+    // pipe instances, or is_daemon_running() consumed the previous one.
+    let mut attempts = 0;
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new().open(&path) {
+            Ok(client) => return Ok(client),
+            Err(e) if e.raw_os_error() == Some(231) && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Create an async listener for the daemon socket.
@@ -90,13 +102,15 @@ pub fn is_daemon_running() -> bool {
     }
     #[cfg(windows)]
     {
-        // Try to open the named pipe
+        // Try to open the named pipe.
+        // ERROR_PIPE_BUSY (231) means the pipe exists but all instances are
+        // in use — the daemon IS running, just busy.
         use std::fs::OpenOptions;
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(socket_path())
-            .is_ok()
+        match OpenOptions::new().read(true).write(true).open(socket_path()) {
+            Ok(_) => true,
+            Err(e) if e.raw_os_error() == Some(231) => true, // ERROR_PIPE_BUSY
+            Err(_) => false,
+        }
     }
 }
 

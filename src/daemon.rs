@@ -91,10 +91,12 @@ async fn run_windows(
         tokio::select! {
             result = pipe.connect() => {
                 if result.is_ok() {
+                    // Create the next pipe BEFORE handling, so new clients
+                    // can connect while we process this request.
+                    let next = platform::create_next_pipe_instance()?;
                     let (mut rd, mut wr) = tokio::io::split(pipe);
                     let kill = handle_one(&mut rd, &mut wr, mgr).await;
-                    // Create a fresh pipe instance for the next client.
-                    pipe = platform::create_next_pipe_instance()?;
+                    pipe = next;
                     if kill == Some(true) {
                         break;
                     }

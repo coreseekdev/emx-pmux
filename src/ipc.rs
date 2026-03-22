@@ -517,21 +517,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-// ── Legacy compatibility shims ───────────────────────────────────────
-
-/// Alias for backward-compatible API: write handshake is now embedded in
-/// write_msg (the revision field serves as magic + version check).
-pub async fn write_handshake<W: AsyncWrite + Unpin>(_w: &mut W) -> std::io::Result<()> {
-    // No separate handshake needed — each message carries the revision magic.
-    Ok(())
-}
-
-/// Alias for backward-compatible API: read handshake is now done in read_msg.
-pub async fn read_handshake<R: AsyncRead + Unpin>(_r: &mut R) -> std::io::Result<i32> {
-    // No separate handshake needed — each message carries the revision magic.
-    Ok(PROTOCOL_REVISION)
-}
-
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]

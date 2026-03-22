@@ -60,21 +60,34 @@ impl Session {
 
         let mut reader: PtyReader = match self.master.try_clone() {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("[pmux] reader: try_clone failed: {}", e);
+                return;
+            }
         };
 
+        let name = self.name.clone();
         thread::spawn(move || {
+            eprintln!("[pmux] reader({}): started", name);
             let mut buf = [0u8; 8192];
+            let mut total = 0usize;
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        eprintln!("[pmux] reader({}): EOF after {} bytes", name, total);
+                        break;
+                    }
                     Ok(n) => {
+                        total += n;
                         if let Ok(mut scr) = screen.lock() {
                             scr.feed(&buf[..n]);
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("[pmux] reader({}): error after {} bytes: {}", name, total, e);
+                        break;
+                    }
                 }
             }
             alive.store(false, Ordering::SeqCst);
@@ -89,6 +102,11 @@ impl Session {
     /// Get current screen content as text.
     pub fn screen_text(&self) -> String {
         self.screen.lock().unwrap().text()
+    }
+
+    /// Get cursor position (col, row).
+    pub fn cursor_pos(&self) -> (u16, u16) {
+        self.screen.lock().unwrap().cursor()
     }
 
     /// Get screen size.
@@ -130,8 +148,8 @@ impl Drop for Session {
     }
 }
 
-/// Serializable session info for IPC responses.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Session info for IPC responses.
+#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub name: String,
     pub command: String,
@@ -229,6 +247,14 @@ impl SessionManager {
     pub fn view(&self, name: &str) -> Result<String, String> {
         match self.sessions.get(name) {
             Some(s) => Ok(s.screen_text()),
+            None => Err(format!("Session '{}' not found", name)),
+        }
+    }
+
+    /// Get cursor position of a session.
+    pub fn cursor_pos(&self, name: &str) -> Result<(u16, u16), String> {
+        match self.sessions.get(name) {
+            Some(s) => Ok(s.cursor_pos()),
             None => Err(format!("Session '{}' not found", name)),
         }
     }

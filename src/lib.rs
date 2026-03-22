@@ -5,3 +5,4 @@ pub mod platform;
 pub mod pty;
 pub mod screen;
 pub mod session;
+pub mod terminal;
