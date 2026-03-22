@@ -44,8 +44,16 @@ pub struct Pane {
 impl Session {
     /// Create a new session
     pub fn new(name: String) -> Self {
+        // Simple ID generation (timestamp + process ID)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let id = format!("{:x}{:x}", timestamp, pid);
+
         Session {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             name,
             windows: Vec::new(),
         }

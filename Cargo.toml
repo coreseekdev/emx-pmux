@@ -17,4 +17,9 @@ name = "pmux"
 path = "src/main.rs"
 
 [dependencies]
-# TODO: add dependencies when implementing
+# Platform-specific dependencies
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["process", "fs", "signal"] }
+
+# Optional: for UUID generation (can be replaced with simpler impl)
+uuid = { version = "1", optional = true }
