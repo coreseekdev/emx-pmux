@@ -36,6 +36,7 @@ pub struct CellAttr {
 pub enum Color {
     Default,
     Index(u8),
+    Rgb(u8, u8, u8),
 }
 
 impl Default for Color {
@@ -56,6 +57,27 @@ pub struct Screen {
     /// Saved cursor position (for DECSC/DECRC).
     saved_cursor: (u16, u16),
     /// Scroll region (top, bottom) - 0-based, inclusive.
+    scroll_top: u16,
+    scroll_bottom: u16,
+    // ── DEC mode flags ───────────────────────────────────
+    /// DECAWM: auto-wrap mode (default on).
+    auto_wrap: bool,
+    /// DECTCEM: cursor visible.
+    cursor_visible: bool,
+    /// Whether we are in the alternate screen buffer.
+    alt_active: bool,
+    /// Saved primary screen state (cells, cursor, scroll region, attr).
+    alt_saved: Option<AltSaved>,
+    /// Window/icon title set via OSC 0/1/2.
+    pub title: String,
+}
+
+/// Saved state when switching to alternate screen.
+struct AltSaved {
+    cells: Vec<Cell>,
+    cursor_x: u16,
+    cursor_y: u16,
+    attr: CellAttr,
     scroll_top: u16,
     scroll_bottom: u16,
 }
@@ -85,13 +107,17 @@ impl Screen {
             saved_cursor: (0, 0),
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
+            auto_wrap: true,
+            cursor_visible: true,
+            alt_active: false,
+            alt_saved: None,
+            title: String::new(),
         }
     }
 
     /// Feed raw bytes from the PTY into the screen parser.
     pub fn feed(&mut self, data: &[u8]) {
         // Split borrow: parser vs the rest of the screen state.
-        // We create the performer once and advance for each byte.
         let Screen {
             cols,
             rows,
@@ -103,6 +129,11 @@ impl Screen {
             ref mut saved_cursor,
             ref mut scroll_top,
             ref mut scroll_bottom,
+            ref mut auto_wrap,
+            ref mut cursor_visible,
+            ref mut alt_active,
+            ref mut alt_saved,
+            ref mut title,
         } = *self;
 
         let mut performer = ScreenPerformer {
@@ -115,6 +146,11 @@ impl Screen {
             saved_cursor,
             scroll_top,
             scroll_bottom,
+            auto_wrap,
+            cursor_visible,
+            alt_active,
+            alt_saved,
+            title,
         };
         for &byte in data {
             parser.advance(&mut performer, byte);
@@ -209,6 +245,11 @@ struct ScreenPerformer<'a> {
     saved_cursor: &'a mut (u16, u16),
     scroll_top: &'a mut u16,
     scroll_bottom: &'a mut u16,
+    auto_wrap: &'a mut bool,
+    cursor_visible: &'a mut bool,
+    alt_active: &'a mut bool,
+    alt_saved: &'a mut Option<AltSaved>,
+    title: &'a mut String,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -218,9 +259,13 @@ impl<'a> ScreenPerformer<'a> {
 
     fn put_char(&mut self, ch: char) {
         if *self.cursor_x >= self.cols {
-            // Wrap
-            *self.cursor_x = 0;
-            self.line_feed();
+            if *self.auto_wrap {
+                *self.cursor_x = 0;
+                self.line_feed();
+            } else {
+                // No wrap — overwrite last column
+                *self.cursor_x = self.cols.saturating_sub(1);
+            }
         }
         let idx = self.idx(*self.cursor_x, *self.cursor_y);
         if idx < self.cells.len() {
@@ -377,6 +422,11 @@ impl<'a> ScreenPerformer<'a> {
                                     if let Some(idx) = iter.next() {
                                         self.attr.fg = Color::Index(idx[0] as u8);
                                     }
+                                } else if next[0] == 2 {
+                                    let r = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    let g = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    let b = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    self.attr.fg = Color::Rgb(r, g, b);
                                 }
                             }
                         }
@@ -388,6 +438,11 @@ impl<'a> ScreenPerformer<'a> {
                                     if let Some(idx) = iter.next() {
                                         self.attr.bg = Color::Index(idx[0] as u8);
                                     }
+                                } else if next[0] == 2 {
+                                    let r = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    let g = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    let b = iter.next().map(|v| v[0] as u8).unwrap_or(0);
+                                    self.attr.bg = Color::Rgb(r, g, b);
                                 }
                             }
                         }
@@ -434,7 +489,75 @@ impl<'a> Perform for ScreenPerformer<'a> {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
+        // Handle DEC private modes (CSI ? Pn h/l)
+        if intermediates == [b'?'] && (action == 'h' || action == 'l') {
+            let set = action == 'h';
+            for param in params.iter() {
+                match param[0] {
+                    1 => {} // DECCKM – application cursor keys (no-op, not relevant for buffer)
+                    7 => *self.auto_wrap = set,   // DECAWM
+                    25 => *self.cursor_visible = set, // DECTCEM
+                    1049 => {
+                        // Alternate screen buffer (save cursor + switch)
+                        if set && !*self.alt_active {
+                            *self.alt_saved = Some(AltSaved {
+                                cells: self.cells.clone(),
+                                cursor_x: *self.cursor_x,
+                                cursor_y: *self.cursor_y,
+                                attr: *self.attr,
+                                scroll_top: *self.scroll_top,
+                                scroll_bottom: *self.scroll_bottom,
+                            });
+                            // Clear the alternate screen
+                            for cell in self.cells.iter_mut() {
+                                *cell = Cell::default();
+                            }
+                            *self.cursor_x = 0;
+                            *self.cursor_y = 0;
+                            *self.alt_active = true;
+                        } else if !set && *self.alt_active {
+                            if let Some(saved) = self.alt_saved.take() {
+                                *self.cells = saved.cells;
+                                *self.cursor_x = saved.cursor_x;
+                                *self.cursor_y = saved.cursor_y;
+                                *self.attr = saved.attr;
+                                *self.scroll_top = saved.scroll_top;
+                                *self.scroll_bottom = saved.scroll_bottom;
+                            }
+                            *self.alt_active = false;
+                        }
+                    }
+                    47 | 1047 => {
+                        // Alternate screen (without save/restore cursor)
+                        if set && !*self.alt_active {
+                            *self.alt_saved = Some(AltSaved {
+                                cells: self.cells.clone(),
+                                cursor_x: *self.cursor_x,
+                                cursor_y: *self.cursor_y,
+                                attr: *self.attr,
+                                scroll_top: *self.scroll_top,
+                                scroll_bottom: *self.scroll_bottom,
+                            });
+                            for cell in self.cells.iter_mut() {
+                                *cell = Cell::default();
+                            }
+                            *self.alt_active = true;
+                        } else if !set && *self.alt_active {
+                            if let Some(saved) = self.alt_saved.take() {
+                                *self.cells = saved.cells;
+                                *self.scroll_top = saved.scroll_top;
+                                *self.scroll_bottom = saved.scroll_bottom;
+                            }
+                            *self.alt_active = false;
+                        }
+                    }
+                    _ => {} // ignore other DEC modes
+                }
+            }
+            return;
+        }
+
         let p = |i: usize, default: u16| -> u16 {
             params.iter().nth(i).map_or(default, |v| if v[0] == 0 { default } else { v[0] as u16 })
         };
@@ -621,7 +744,18 @@ impl<'a> Perform for ScreenPerformer<'a> {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC 0 / 1 / 2 — set window/icon title
+        if let Some(&first) = params.first() {
+            if first == b"0" || first == b"1" || first == b"2" {
+                if let Some(&title_bytes) = params.get(1) {
+                    if let Ok(t) = std::str::from_utf8(title_bytes) {
+                        *self.title = t.to_string();
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -690,5 +824,53 @@ mod tests {
         screen.feed(b"Line1\r\nLine2\r\nLine3");
         let text = screen.text();
         assert_eq!(text, "Line1\nLine2\nLine3");
+    }
+
+    #[test]
+    fn rgb_colors() {
+        let mut screen = Screen::new(80, 24);
+        // ESC[38;2;255;128;0m  — set fg to RGB(255,128,0)
+        screen.feed(b"\x1b[38;2;255;128;0mHi");
+        assert_eq!(screen.cell(0, 0).attr.fg, Color::Rgb(255, 128, 0));
+    }
+
+    #[test]
+    fn alternate_screen_buffer() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"Primary");
+        assert_eq!(screen.line_text(0), "Primary");
+        // Switch to alt screen
+        screen.feed(b"\x1b[?1049h");
+        assert!(screen.alt_active);
+        assert_eq!(screen.line_text(0), ""); // alt screen is blank
+        screen.feed(b"Alt");
+        assert_eq!(screen.line_text(0), "Alt");
+        // Switch back to primary
+        screen.feed(b"\x1b[?1049l");
+        assert!(!screen.alt_active);
+        assert_eq!(screen.line_text(0), "Primary");
+    }
+
+    #[test]
+    fn auto_wrap_mode() {
+        // DECAWM on by default — text wraps
+        let mut screen = Screen::new(5, 3);
+        screen.feed(b"12345X");
+        assert_eq!(screen.line_text(0), "12345");
+        assert_eq!(screen.line_text(1), "X");
+        // Turn off auto-wrap
+        let mut screen2 = Screen::new(5, 3);
+        screen2.feed(b"\x1b[?7l"); // DECRST 7
+        screen2.feed(b"12345X");
+        assert_eq!(screen2.line_text(0), "1234X"); // X overwrites col 4
+        assert_eq!(screen2.line_text(1), "");
+    }
+
+    #[test]
+    fn osc_title() {
+        let mut screen = Screen::new(80, 24);
+        // OSC 0; title ST
+        screen.feed(b"\x1b]0;My Window\x1b\\");
+        assert_eq!(screen.title, "My Window");
     }
 }

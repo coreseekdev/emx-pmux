@@ -4,7 +4,7 @@ use pmux::ipc::{self, Request, Response};
 use pmux::platform;
 use std::process;
 
-/// Parse C-style escape sequences in a string (\n, \r, \t, \\, \xHH).
+/// Parse C-style escape sequences in a string (\n, \r, \t, \\, \e, \xHH, \uXXXX).
 fn unescape(s: &str) -> Vec<u8> {
     let mut result = Vec::with_capacity(s.len());
     let mut chars = s.chars();
@@ -17,6 +17,29 @@ fn unescape(s: &str) -> Vec<u8> {
                 Some('\\') => result.push(b'\\'),
                 Some('0') => result.push(0),
                 Some('a') => result.push(0x07),
+                Some('e') | Some('E') => result.push(0x1B),
+                Some('u') => {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        if let Some(&next) = chars.as_str().as_bytes().first() {
+                            if (next as char).is_ascii_hexdigit() {
+                                hex.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            let mut buf = [0u8; 4];
+                            result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                    } else {
+                        result.push(b'\\');
+                        result.push(b'u');
+                        result.extend(hex.as_bytes());
+                    }
+                }
                 Some('x') => {
                     let mut hex = String::new();
                     for _ in 0..2 {
@@ -79,6 +102,7 @@ async fn rpc(req: &Request) -> Result<Response, String> {
     let stream =
         platform::connect_daemon().await.map_err(|e| format!("cannot connect to daemon: {}", e))?;
     let (mut rd, mut wr) = tokio::io::split(stream);
+    ipc::write_handshake(&mut wr).await.map_err(|e| format!("handshake failed: {}", e))?;
     ipc::send_msg(&mut wr, req).await.map_err(|e| format!("send failed: {}", e))?;
     ipc::recv_msg(&mut rd).await.map_err(|e| format!("recv failed: {}", e))
 }

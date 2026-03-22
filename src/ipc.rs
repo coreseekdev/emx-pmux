@@ -1,11 +1,19 @@
 //! IPC protocol for client ↔ daemon communication.
 //!
 //! Length-prefixed JSON messages over tokio async streams.
+//! The first 4 bytes of each connection are a protocol version magic (`PMUX`),
+//! followed by a 2-byte protocol version (big-endian u16).
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::session::SessionInfo;
+
+/// Protocol version. Bump when the wire format changes.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Magic bytes that identify a pmux IPC connection.
+const MAGIC: &[u8; 4] = b"PMUX";
 
 // ── Request ──────────────────────────────────────────────────────────
 
@@ -49,9 +57,43 @@ pub enum Response {
 }
 
 // ── Wire format ──────────────────────────────────────────────────────
-// 4 bytes big-endian length + JSON payload.
+// Connection: MAGIC (4 bytes) + version (2 bytes big-endian)
+// Each message: 4 bytes big-endian length + JSON payload.
 
 const MAX_MSG: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Write the protocol handshake header (client side).
+pub async fn write_handshake<W: AsyncWrite + Unpin>(w: &mut W) -> std::io::Result<()> {
+    w.write_all(MAGIC).await?;
+    w.write_all(&PROTOCOL_VERSION.to_be_bytes()).await?;
+    Ok(())
+}
+
+/// Read and validate the protocol handshake header (server side).
+/// Returns the client's protocol version.
+pub async fn read_handshake<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<u16> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic).await?;
+    if &magic != MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a pmux client",
+        ));
+    }
+    let mut ver = [0u8; 2];
+    r.read_exact(&mut ver).await?;
+    let version = u16::from_be_bytes(ver);
+    if version != PROTOCOL_VERSION {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "protocol version mismatch: client={}, daemon={}",
+                version, PROTOCOL_VERSION
+            ),
+        ));
+    }
+    Ok(version)
+}
 
 /// Send a serializable value over an async stream.
 pub async fn send_msg<W: AsyncWrite + Unpin, T: Serialize>(

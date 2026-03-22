@@ -1,22 +1,22 @@
 # emx-pmux 当前限制与局限
 
-修正 BUG-1 ~ BUG-7 及性能优化后，以下为仍然存在的已知限制。
+v0.3.0 — 已完成同步→异步重构 (tokio)，修正 BUG-1 ~ BUG-7 及性能优化后。
 
 ---
 
 ## 一、架构限制
 
-### 1. 单线程 Daemon 事件循环
-- Daemon 使用 `sleep(50ms)` 轮询而非 epoll/IOCP 事件驱动
-- 每轮只 accept 一个连接，高并发时存在排队延迟
-- **影响**: 大量 session 或高频 RPC 调用时吞吐量受限
-- **对比**: rust-expect 使用 tokio 异步运行时，expectrl 使用 async-io
+### ~~1. 单线程 Daemon 事件循环~~ ✅ 已解决 (v0.3.0)
+- ~~Daemon 使用 `sleep(50ms)` 轮询而非 epoll/IOCP 事件驱动~~
+- **现状**: Daemon 使用 `tokio::select!` 事件驱动，Unix 用 `UnixListener`，Windows 用 Named Pipe
+- 每轮处理一个连接仍然是串行的（accept → handle → next accept），可考虑 `tokio::spawn` 并发处理
 
-### 2. 同步阻塞 IO 模型
-- 每个 session 占用一个 reader 线程（阻塞 read）
-- N 个 session = N 个系统线程
-- **影响**: 100+ session 时线程开销显著
-- **对比**: rust-expect 使用 tokio AsyncFd 多路复用，单线程管理多 session
+### ~~2. 同步阻塞 IO 模型~~ ⚠️ 部分解决 (v0.3.0)
+- IPC 层已完全异步 (`AsyncRead`/`AsyncWrite`)
+- 每个 session 的 PTY reader 线程仍使用 `std::thread` + 阻塞 `read()`
+- **原因**: PTY 文件描述符 / HANDLE 不支持原生 async，阻塞 read 是正确做法
+- **影响**: N 个 session = N 个 OS 线程（但 overhead 远小于 N 个同步 IPC 连接）
+- **对比**: rust-expect 在 Unix 上使用 `AsyncFd` 包装 PTY fd（仅限 Linux epoll）
 
 ### 3. 无 Scrollback / History Buffer
 - Screen buffer 只保留当前可见区域 (cols × rows)
@@ -29,7 +29,7 @@
 ## 二、PTY 层限制
 
 ### 4. Unix: 无 SIGCHLD 处理
-- 子进程退出后靠 reader 线程 EOF 检测 + daemon reap 轮询发现
+- 子进程退出后靠 reader 线程 EOF 检测 + daemon reap interval (2s) 发现
 - 不处理 SIGCHLD 信号，可能短暂产生僵尸进程（直到下一轮 reap）
 - **对比**: rust-expect 使用 signal-hook-tokio 即时响应
 
@@ -53,39 +53,41 @@
 
 ## 三、IPC 层限制
 
-### 8. 无协议版本化
-- 请求/响应结构变更时旧客户端与新守护进程不兼容
-- 无版本协商机制
-- **影响**: 升级 pmux 时需要 `--stop` 后重启 daemon
+### ~~8. 无协议版本化~~ ✅ 已解决 (v0.3.0)
+- ~~请求/响应结构变更时旧客户端与新守护进程不兼容~~
+- **现状**: IPC 连接开头发送 magic `PMUX` + 2-byte 版本号，daemon 校验后处理
+- 版本不匹配时返回明确错误信息
 
 ### 9. 无身份验证
 - 任何能连接到命名管道/socket 的进程都可控制 daemon
 - Unix 靠文件权限保护，Windows Named Pipe 无额外 ACL
 - **影响**: 同机多用户场景下存在安全风险
 
-### 10. 单请求-单响应模型
-- 每次 RPC 需建立新连接、完成请求、关闭连接
-- 无连接复用、无流式传输
-- **影响**: `stuff` + `view` 高频交互时连接开销可观
+### ~~10. 单请求-单响应模型~~ ⚠️ 部分改善 (v0.3.0)
+- 每次 RPC 仍需建立新连接
+- 但连接建立/收发已是 async，开销显著降低（无线程创建、无阻塞等待）
+- **剩余问题**: 无流式传输（attach 模式需要持久双向连接）
 
 ---
 
 ## 四、Screen 层限制
 
-### 11. 不完整的 VT100/ANSI 支持
+### 11. 不完整的 VT100/ANSI 支持 ⚠️ 大幅改善 (v0.3.0)
 已实现的 CSI 序列:
 - 光标移动 (CUU/CUD/CUF/CUB/CUP/CNL/CPL/CHA/VPA)
 - 擦除 (ED/EL/ECH)
 - 行操作 (IL/DL/ICH/DCH)
 - 滚动 (SU/SD/DECSTBM)
 - SGR (基本颜色 0-15、256 色索引)
+- ✅ 24-bit RGB 颜色 (SGR 38;2;r;g;b / 48;2;r;g;b)
+- ✅ DEC 私有模式 (DECAWM 自动换行, DECTCEM 光标可见性, DECSET 1049/47/1047 替代屏幕)
+- ✅ 替代屏幕缓冲 (DECSET/DECRST 1049, 保存/恢复主屏幕)
+- ✅ OSC 0/1/2 序列 (窗口标题设置)
 
-**未实现**:
-- 24-bit RGB 颜色 (SGR 38;2;r;g;b)
+**仍未实现**:
 - 字符集切换 (G0/G1, SCS)
-- DEC 私有模式 (DECCKM, DECOM, DECAWM, DECTCEM 等)
-- 替代屏幕缓冲 (DECSET 1049)
-- OSC 序列 (窗口标题、剪贴板等)
+- DECCKM, DECOM (应用光标键、原点模式)
+- OSC 52 (剪贴板)
 - 鼠标追踪
 - Unicode 宽字符 (CJK 双宽度字符占位)
 
@@ -108,9 +110,9 @@
 - 无 "attached client" 概念
 - **影响**: 不支持 `screen -d -r` 式的抢占 attach
 
-### 15. stuff 转义处理的局限
-- 已实现: `\n`, `\r`, `\t`, `\\`, `\0`, `\a`, `\xHH`
-- 未实现: `\e` (ESC, 0x1B)、`\uXXXX` (Unicode)、八进制 `\NNN`
+### ~~15. stuff 转义处理的局限~~ ✅ 大幅改善 (v0.3.0)
+- 已实现: `\n`, `\r`, `\t`, `\\`, `\0`, `\a`, `\xHH`, ✅ `\e`/`\E` (ESC 0x1B), ✅ `\uXXXX` (Unicode)
+- 未实现: 八进制 `\NNN`
 - Shell 的 `$'\x03'` 语法依赖 shell 展开，pmux 自身不处理 `$'...'`
 
 ---
@@ -126,17 +128,19 @@
 - PtyMaster write 错误直接透传，无重试
 - Daemon accept 错误被静默忽略
 
-### 18. 无优雅关闭
-- `--stop` 发送 KillServer 后 daemon 立即退出
-- 不等待子进程清理完成
-- Unix daemon 不处理 SIGTERM（只忽略 SIGINT）
+### 18. 无优雅关闭 ⚠️ 部分解决 (v0.3.0)
+- `--stop` 发送 KillServer 后 daemon 退出（Session Drop 触发 child.kill()）
+- ✅ Unix daemon 现在处理 SIGTERM（通过 tokio signal 异步接收，优雅退出事件循环）
+- ✅ Windows daemon 处理 Ctrl-C（通过 tokio::signal::ctrl_c）
+- **剩余**: 退出时不等待子进程完全终止（kill 后立即返回）
 
 ---
 
 ## 七、性能局限
 
-### 19. Screen buffer 加锁粒度
-- 整个 Screen 被一个 Mutex 保护
+### ~~19. Screen buffer 加锁粒度~~ ⚠️ 部分解决 (v0.3.0)
+- ~~整个 Screen 被一个 Mutex 保护~~
+- 现状: 仍使用 `Mutex<Screen>`，但 alive 标志已改用 `AtomicBool`（无锁）
 - reader 线程写入和 client view 读取互相阻塞
 - **优化方向**: 可使用 RwLock 或 double-buffer 减少读写冲突
 

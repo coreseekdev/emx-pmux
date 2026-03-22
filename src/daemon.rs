@@ -40,8 +40,10 @@ async fn run_unix(
 ) -> io::Result<()> {
     let listener = platform::create_listener().await?;
 
-    // Ignore SIGINT in daemon – exit via KillServer or auto-exit.
+    // Ignore SIGINT in daemon – exit via KillServer, SIGTERM, or auto-exit.
     unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN); }
+
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         tokio::select! {
@@ -55,6 +57,9 @@ async fn run_unix(
                     }
                     Err(_) => {} // transient accept error
                 }
+            }
+            _ = sigterm.recv() => {
+                break;
             }
             _ = reap_interval.tick() => {
                 mgr.reap_dead();
@@ -79,6 +84,8 @@ async fn run_windows(
     reap_interval: &mut tokio::time::Interval,
 ) -> io::Result<()> {
     let mut pipe = platform::create_pipe_instance()?;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
 
     loop {
         tokio::select! {
@@ -94,6 +101,9 @@ async fn run_windows(
                 } else {
                     pipe = platform::create_next_pipe_instance()?;
                 }
+            }
+            _ = &mut ctrl_c => {
+                break;
             }
             _ = reap_interval.tick() => {
                 mgr.reap_dead();
@@ -117,6 +127,11 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // Validate protocol handshake
+    if ipc::read_handshake(rd).await.is_err() {
+        return None;
+    }
+
     let req: Request = match ipc::recv_msg(rd).await {
         Ok(r) => r,
         Err(_) => return None,
