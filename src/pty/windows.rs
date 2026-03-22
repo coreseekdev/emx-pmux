@@ -85,12 +85,10 @@ impl PtyMaster {
         }
     }
 
-    /// Clone the handle for reading in another thread.
-    ///
-    /// The clone shares the same underlying ConPTY but duplicates
-    /// the output (read) pipe handle. Writing is only safe from the
-    /// original handle.
-    pub fn try_clone(&self) -> PtyResult<Self> {
+    /// Clone only the read handle for use in a reader thread.
+    /// The returned `PtyReader` does NOT own the HPCON, so dropping it
+    /// will not close the pseudo console.
+    pub fn try_clone(&self) -> PtyResult<PtyReader> {
         use windows_sys::Win32::Foundation::DuplicateHandle;
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -115,15 +113,8 @@ impl PtyMaster {
         };
 
         let output_read = dup(&self.output_read).map_err(PtyError::Io)?;
-        let input_write = dup(&self.input_write).map_err(PtyError::Io)?;
 
-        Ok(PtyMaster {
-            hpc: self.hpc,
-            input_write,
-            output_read,
-            open: self.open,
-            size: self.size,
-        })
+        Ok(PtyReader { output_read })
     }
 
     /// Set non-blocking mode (no-op on Windows, pipes are always blocking).
@@ -270,6 +261,37 @@ impl PtyChild {
             }
         }
         Ok(())
+    }
+}
+
+/// Read-only handle for the PTY output pipe.
+/// Does NOT own the HPCON — dropping this will not close the pseudo console.
+pub struct PtyReader {
+    output_read: OwnedHandle,
+}
+
+unsafe impl Send for PtyReader {}
+
+impl Read for PtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut bytes_read: u32 = 0;
+        let success = unsafe {
+            ReadFile(
+                self.output_read.as_raw_handle() as HANDLE,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut bytes_read,
+                ptr::null_mut(),
+            )
+        };
+        if success == FALSE {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(109) {
+                return Ok(0); // EOF — broken pipe
+            }
+            return Err(err);
+        }
+        Ok(bytes_read as usize)
     }
 }
 
@@ -534,11 +556,17 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
 
 fn build_env_block(config: &PtyConfig) -> Vec<u16> {
     if config.env.is_empty() {
-        return Vec::new();
+        return Vec::new(); // NULL → inherit parent environment
+    }
+
+    // Start with the parent process environment, then overlay custom vars.
+    let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for (key, value) in &config.env {
+        env_map.insert(key.clone(), value.clone());
     }
 
     let mut block = Vec::new();
-    for (key, value) in &config.env {
+    for (key, value) in &env_map {
         let entry = format!("{}={}", key, value);
         block.extend(entry.encode_utf16());
         block.push(0);

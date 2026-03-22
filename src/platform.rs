@@ -1,12 +1,11 @@
 //! Platform utilities: socket naming, daemon spawning, connection helpers.
 
-use interprocess::local_socket::{prelude::*, GenericFilePath, GenericNamespaced, ListenerOptions};
 use std::io;
 
 // ── Socket naming ────────────────────────────────────────────────────
 
 /// Runtime directory for pmux files (PID files, Unix sockets).
-fn runtime_dir() -> String {
+pub fn runtime_dir() -> String {
     #[cfg(windows)]
     {
         let base = std::env::var("LOCALAPPDATA")
@@ -28,56 +27,77 @@ pub fn ensure_runtime_dir() -> io::Result<()> {
     std::fs::create_dir_all(runtime_dir())
 }
 
-/// Socket name / path for the daemon.
-fn socket_name() -> String {
-    if GenericNamespaced::is_supported() {
-        // Windows named pipe or Linux abstract namespace
-        "@pmux_daemon".into()
-    } else {
+/// Socket path for the daemon.
+pub fn socket_path() -> String {
+    #[cfg(unix)]
+    {
         format!("{}/daemon.sock", runtime_dir())
     }
-}
-
-fn to_name(s: &str) -> io::Result<interprocess::local_socket::Name<'_>> {
-    if GenericNamespaced::is_supported() {
-        s.to_ns_name::<GenericNamespaced>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-    } else {
-        s.to_fs_name::<GenericFilePath>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    #[cfg(windows)]
+    {
+        // Named pipe path on Windows
+        r"\\.\pipe\pmux_daemon".to_string()
     }
 }
 
-// ── Connection ───────────────────────────────────────────────────────
+// ── Connection (async) ───────────────────────────────────────────────
 
-/// Connect to the running daemon. Returns a bidirectional stream.
-pub fn connect_daemon() -> io::Result<interprocess::local_socket::Stream> {
-    let name_str = socket_name();
-    let name = to_name(&name_str)?;
-    interprocess::local_socket::Stream::connect(name)
+/// Async connect to the running daemon.
+#[cfg(unix)]
+pub async fn connect_daemon() -> io::Result<tokio::net::UnixStream> {
+    let path = socket_path();
+    tokio::net::UnixStream::connect(&path).await
 }
 
-/// Create a listener for the daemon socket.
-pub fn create_listener() -> io::Result<interprocess::local_socket::Listener> {
+#[cfg(windows)]
+pub async fn connect_daemon() -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    let path = socket_path();
+    tokio::net::windows::named_pipe::ClientOptions::new().open(&path)
+}
+
+/// Create an async listener for the daemon socket.
+#[cfg(unix)]
+pub async fn create_listener() -> io::Result<tokio::net::UnixListener> {
     ensure_runtime_dir()?;
-    let name_str = socket_name();
-
-    // Clean up stale socket on Unix
-    #[cfg(unix)]
-    if !GenericNamespaced::is_supported() {
-        let _ = std::fs::remove_file(&name_str);
-    }
-
-    let name = to_name(&name_str)?;
-    ListenerOptions::new()
-        .name(name)
-        .create_sync()
-        .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, e))
+    let path = socket_path();
+    // Clean up stale socket
+    let _ = std::fs::remove_file(&path);
+    tokio::net::UnixListener::bind(&path)
 }
 
-/// Check if a daemon is reachable.
+#[cfg(windows)]
+pub fn create_pipe_instance() -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let path = socket_path();
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&path)
+}
+
+#[cfg(windows)]
+pub fn create_next_pipe_instance() -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let path = socket_path();
+    tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(false)
+        .create(&path)
+}
+
+/// Check if a daemon is reachable (sync, used by spawn logic).
 pub fn is_daemon_running() -> bool {
-    connect_daemon().is_ok()
+    // Quick sync check by trying to connect
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        // Try to open the named pipe
+        use std::fs::OpenOptions;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(socket_path())
+            .is_ok()
+    }
 }
 
 // ── PID file ─────────────────────────────────────────────────────────
@@ -93,10 +113,9 @@ pub fn write_pid_file() -> io::Result<()> {
 
 pub fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_path());
-    // Also clean up socket on Unix
     #[cfg(unix)]
-    if !GenericNamespaced::is_supported() {
-        let _ = std::fs::remove_file(format!("{}/daemon.sock", runtime_dir()));
+    {
+        let _ = std::fs::remove_file(socket_path());
     }
 }
 
@@ -110,7 +129,6 @@ pub fn spawn_daemon() -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW | DETACHED_PROCESS
         const FLAGS: u32 = 0x08000000 | 0x00000008;
         let child = std::process::Command::new(exe)
             .arg("--daemon")
@@ -136,16 +154,15 @@ pub fn spawn_daemon() -> io::Result<u32> {
 
 /// Spawn daemon if not already running. Returns Ok(()) when the daemon
 /// is accepting connections.
-pub fn ensure_daemon() -> io::Result<()> {
+pub async fn ensure_daemon() -> io::Result<()> {
     if is_daemon_running() {
         return Ok(());
     }
     spawn_daemon()?;
-    // Poll until daemon is reachable.
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(5);
     while start.elapsed() < timeout {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         if is_daemon_running() {
             return Ok(());
         }

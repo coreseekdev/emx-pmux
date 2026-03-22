@@ -25,6 +25,7 @@ pub fn run() -> io::Result<()> {
 
     let mut mgr = SessionManager::new();
     let shutdown = Arc::new(AtomicBool::new(false));
+    let mut had_sessions = false;
 
     // Ctrl-C handler (best-effort)
     {
@@ -53,13 +54,13 @@ pub fn run() -> io::Result<()> {
         // Reap dead sessions.
         mgr.reap_dead();
 
-        // Auto-exit when no sessions remain and we had at least one before.
-        // (We skip this check until a session has been created so the daemon
-        // doesn't instantly exit on startup.)
-        // Actually, since daemon is spawned on `new`, the first thing that
-        // happens is a NewSession request. We can simply check count == 0
-        // after we've accepted at least one request. To keep it simple,
-        // we do a lightweight sleep to avoid busy-waiting.
+        // Auto-exit when all sessions have ended (and we had at least one).
+        if had_sessions && mgr.count() == 0 {
+            break;
+        }
+        if mgr.count() > 0 {
+            had_sessions = true;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 

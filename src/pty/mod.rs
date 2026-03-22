@@ -14,9 +14,9 @@ mod windows;
 pub use error::{PtyError, PtyResult};
 
 #[cfg(unix)]
-pub use unix::{PtyMaster, PtyChild, spawn};
+pub use unix::{PtyMaster, PtyChild, PtyReader, spawn};
 #[cfg(windows)]
-pub use windows::{PtyMaster, PtyChild, spawn};
+pub use windows::{PtyMaster, PtyChild, PtyReader, spawn};
 
 /// Window size for PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

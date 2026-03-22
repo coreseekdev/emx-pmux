@@ -4,6 +4,53 @@ use pmux::ipc::{self, Request, Response};
 use pmux::platform;
 use std::process;
 
+/// Parse C-style escape sequences in a string (\n, \r, \t, \\, \xHH).
+fn unescape(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push(b'\n'),
+                Some('r') => result.push(b'\r'),
+                Some('t') => result.push(b'\t'),
+                Some('\\') => result.push(b'\\'),
+                Some('0') => result.push(0),
+                Some('a') => result.push(0x07),
+                Some('x') => {
+                    let mut hex = String::new();
+                    for _ in 0..2 {
+                        if let Some(&next) = chars.as_str().as_bytes().first() {
+                            if (next as char).is_ascii_hexdigit() {
+                                hex.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        result.push(byte);
+                    } else {
+                        result.push(b'\\');
+                        result.push(b'x');
+                        result.extend(hex.as_bytes());
+                    }
+                }
+                Some(other) => {
+                    result.push(b'\\');
+                    let mut buf = [0u8; 4];
+                    result.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                }
+                None => result.push(b'\\'),
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    result
+}
+
 fn main() {
     let args = Args::parse();
     let mode = args.mode();
@@ -125,9 +172,10 @@ fn run_exec(args: &Args) -> Result<(), String> {
                 return Err("stuff requires text argument".into());
             }
             let text = cmd_args.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ");
+            let data = unescape(&text);
             let resp = rpc(&Request::SendData {
                 name: name.clone(),
-                data: text.into_bytes(),
+                data,
             })?;
             match resp {
                 Response::Ok => Ok(()),
@@ -208,8 +256,8 @@ fn run_status() -> Result<(), String> {
         println!("daemon is running");
         Ok(())
     } else {
-        println!("daemon is not running");
-        process::exit(1);
+        eprintln!("daemon is not running");
+        Err("daemon is not running".into())
     }
 }
 

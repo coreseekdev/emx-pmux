@@ -77,11 +77,12 @@ impl PtyMaster {
         self.open = false;
     }
 
-    /// Clone the master handle for use in another thread (e.g. reader).
-    pub fn try_clone(&self) -> PtyResult<Self> {
+    /// Clone only the read handle for use in a reader thread.
+    /// The returned `PtyReader` is a separate type that only supports reading.
+    pub fn try_clone(&self) -> PtyResult<PtyReader> {
         let new_fd = self.fd.try_clone()
             .map_err(|e| PtyError::Io(e))?;
-        Ok(PtyMaster {
+        Ok(PtyReader {
             fd: new_fd,
             open: self.open,
         })
@@ -114,6 +115,22 @@ impl Write for PtyMaster {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Read-only handle for the PTY output.
+pub struct PtyReader {
+    fd: OwnedFd,
+    open: bool,
+}
+
+impl Read for PtyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.open {
+            return Ok(0);
+        }
+        rustix::io::read(&self.fd, buf)
+            .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
     }
 }
 
@@ -332,9 +349,7 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
     }
 
     // ---- Parent process ----
-    // Set non-blocking on master
-    rustix::fs::fcntl_setfl(&master_fd, OFlags::NONBLOCK)
-        .map_err(|e| PtyError::Create(io::Error::from_raw_os_error(e.raw_os_error())))?;
+    // Master fd stays blocking — the reader thread is dedicated and can block.
 
     // Set initial window size on master
     let master = PtyMaster {

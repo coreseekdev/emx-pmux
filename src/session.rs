@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
-use crate::pty::{self, PtyChild, PtyConfig, PtyMaster, PtyResult, WindowSize};
+use crate::pty::{self, PtyChild, PtyConfig, PtyMaster, PtyReader, PtyResult, WindowSize};
 use crate::screen::Screen;
 
 /// A single session: owns a PTY and a screen buffer.
@@ -55,15 +55,15 @@ impl Session {
         let screen = Arc::clone(&self.screen);
         let alive = Arc::clone(&self.alive);
 
-        // Clone the master fd for reading in the background thread.
-        // On both platforms PtyMaster can be try_clone'd (via OwnedFd::try_clone / DuplicateHandle).
-        let mut reader = match self.master.try_clone() {
+        // Get a read-only handle for the background thread.
+        // PtyReader does NOT own the HPCON / master, so dropping it is safe.
+        let mut reader: PtyReader = match self.master.try_clone() {
             Ok(r) => r,
             Err(_) => return,
         };
 
         thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -163,19 +163,13 @@ impl SessionManager {
         rows: u16,
     ) -> Result<String, String> {
         let name = name.unwrap_or_else(|| {
-            let n = self.next_id.to_string();
-            self.next_id += 1;
-            // Ensure unique
-            if self.sessions.contains_key(&n) {
-                loop {
-                    let candidate = self.next_id.to_string();
-                    self.next_id += 1;
-                    if !self.sessions.contains_key(&candidate) {
-                        return candidate;
-                    }
+            loop {
+                let candidate = self.next_id.to_string();
+                self.next_id += 1;
+                if !self.sessions.contains_key(&candidate) {
+                    return candidate;
                 }
             }
-            n
         });
 
         if self.sessions.contains_key(&name) {
@@ -184,7 +178,18 @@ impl SessionManager {
 
         let mut config = PtyConfig::default();
         if let Some(cmd) = command {
-            config.program = cmd;
+            // Wrap the command in a shell so compound commands work
+            // (e.g. "tail -f /var/log/syslog" or "echo hello && sleep 1")
+            #[cfg(unix)]
+            {
+                config.args = vec!["-c".to_string(), cmd];
+                // Keep config.program as default shell ($SHELL or /bin/sh)
+            }
+            #[cfg(windows)]
+            {
+                config.program = "cmd.exe".to_string();
+                config.args = vec!["/c".to_string(), cmd];
+            }
         }
         config.size = WindowSize::new(cols, rows);
 

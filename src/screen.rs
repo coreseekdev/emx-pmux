@@ -90,20 +90,34 @@ impl Screen {
 
     /// Feed raw bytes from the PTY into the screen parser.
     pub fn feed(&mut self, data: &[u8]) {
+        // Split borrow: parser vs the rest of the screen state.
+        // We create the performer once and advance for each byte.
+        let Screen {
+            cols,
+            rows,
+            ref mut cells,
+            ref mut cursor_x,
+            ref mut cursor_y,
+            ref mut attr,
+            ref mut parser,
+            ref mut saved_cursor,
+            ref mut scroll_top,
+            ref mut scroll_bottom,
+        } = *self;
+
+        let mut performer = ScreenPerformer {
+            cols,
+            rows,
+            cells,
+            cursor_x,
+            cursor_y,
+            attr,
+            saved_cursor,
+            scroll_top,
+            scroll_bottom,
+        };
         for &byte in data {
-            // vte::Parser requires a Perform impl. We collect actions and apply them.
-            let mut performer = ScreenPerformer {
-                cols: self.cols,
-                rows: self.rows,
-                cells: &mut self.cells,
-                cursor_x: &mut self.cursor_x,
-                cursor_y: &mut self.cursor_y,
-                attr: &mut self.attr,
-                saved_cursor: &mut self.saved_cursor,
-                scroll_top: &mut self.scroll_top,
-                scroll_bottom: &mut self.scroll_bottom,
-            };
-            self.parser.advance(&mut performer, byte);
+            parser.advance(&mut performer, byte);
         }
     }
 
@@ -133,15 +147,26 @@ impl Screen {
 
     /// Get all visible text as a string.
     pub fn text(&self) -> String {
-        let mut lines = Vec::new();
+        // Pre-allocate: rough upper bound is rows * (cols + 1 newline)
+        let mut result = String::with_capacity(self.rows as usize * (self.cols as usize + 1));
+        let mut trailing_empty = 0usize;
         for row in 0..self.rows {
-            lines.push(self.line_text(row));
+            let line = self.line_text(row);
+            if line.is_empty() {
+                trailing_empty += 1;
+            } else {
+                // Flush any buffered empty lines
+                for _ in 0..trailing_empty {
+                    result.push('\n');
+                }
+                trailing_empty = 0;
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(&line);
+            }
         }
-        // Trim trailing empty lines
-        while lines.last().map_or(false, |l| l.is_empty()) {
-            lines.pop();
-        }
-        lines.join("\n")
+        result
     }
 
     /// Resize the screen. Content is best-effort preserved.
