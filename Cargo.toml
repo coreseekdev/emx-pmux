@@ -1,0 +1,20 @@
+[package]
+name = "pmux"
+version = "0.1.0"
+edition = "2021"
+authors = ["emx"]
+description = "A terminal multiplexer for Windows, inspired by tmux and screen"
+license = "MIT"
+repository = "https://github.com/emx/pmux"
+readme = "README.md"
+
+[lib]
+name = "pmux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pmux"
+path = "src/main.rs"
+
+[dependencies]
+# TODO: add dependencies when implementing
