@@ -24,7 +24,7 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, InitializeProcThreadAttributeList,
     TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
     CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, STARTUPINFOEXW,
+    PROCESS_INFORMATION, STARTUPINFOEXW, STARTF_USESTDHANDLES,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
 };
 
@@ -438,9 +438,9 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
         return Err(PtyError::Create(io::Error::from_raw_os_error(result)));
     }
 
-    // Close the PTY-side pipe handles (duped into ConHost)
-    drop(pty_in_read);
-    drop(pty_out_write);
+    // NOTE: pty_in_read and pty_out_write are kept alive until after
+    // CreateProcess.  They were duplicated into ConHost by
+    // CreatePseudoConsole; we drop our copies after the child is spawned.
 
     // Build command line
     let mut cmdline_wide: Vec<u16> = escape_argument(&config.program);
@@ -493,6 +493,12 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
     let mut startup_info: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup_info.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
     startup_info.lpAttributeList = attr_list.as_mut_ptr() as *mut _;
+    // Prevent the child from inheriting the daemon's (null) stdio handles.
+    // Without this, cmd.exe output may go to NUL instead of the ConPTY pipe.
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+    startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
 
     let mut proc_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
 
@@ -524,6 +530,12 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
 
     // Close thread handle
     unsafe { CloseHandle(proc_info.hThread) };
+
+    // Now that the child process is created, close the PTY-side pipe
+    // handles.  ConPTY duplicated them internally; keeping our copies
+    // open would prevent proper EOF detection.
+    drop(pty_in_read);
+    drop(pty_out_write);
 
     let process = unsafe { OwnedHandle::from_raw_handle(proc_info.hProcess as RawHandle) };
 

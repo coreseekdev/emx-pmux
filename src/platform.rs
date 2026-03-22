@@ -143,10 +143,13 @@ pub fn spawn_daemon() -> io::Result<u32> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const FLAGS: u32 = 0x08000000 | 0x00000008;
+        // CREATE_NO_WINDOW (0x0800_0000): console app without a visible
+        // console window.  Do NOT combine with DETACHED_PROCESS — MSDN
+        // says the two flags are mutually exclusive.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let child = std::process::Command::new(exe)
             .arg("--daemon")
-            .creation_flags(FLAGS)
+            .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
