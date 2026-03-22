@@ -206,6 +206,10 @@ async fn run_resume(args: &Args) -> Result<(), String> {
     // Print detach/exit message on a clean line.
     match &result {
         Ok(()) => eprintln!("\r\n[detached from session {}]", name),
+        Err(e) if e.contains("exited") || e.contains("not found") || e.contains("lost connection") => {
+            eprintln!("\r\n[session {} ended]", name);
+            return Ok(()); // PTY exited — not an error
+        }
         Err(e) => eprintln!("\r\n[session {}: {}]", name, e),
     }
     result

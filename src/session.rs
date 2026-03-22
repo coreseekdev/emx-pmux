@@ -128,8 +128,15 @@ impl Session {
     }
 
     /// Check if the child process is still alive.
+    ///
+    /// Checks both the reader thread status (pipe EOF) and the actual
+    /// child process handle.  ConPTY does not produce pipe EOF when the
+    /// child exits, so we must also poll the process handle directly.
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst)
+        if !self.alive.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.child.is_process_alive()
     }
 
     /// Kill the child process.
@@ -255,6 +262,11 @@ impl SessionManager {
             Some(s) => Ok(s.screen_text()),
             None => Err(format!("Session '{}' not found", name)),
         }
+    }
+
+    /// Check whether a session's child process is still alive.
+    pub fn is_alive(&self, name: &str) -> Option<bool> {
+        self.sessions.get(name).map(|s| s.is_alive())
     }
 
     /// Get cursor position of a session.

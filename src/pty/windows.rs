@@ -217,6 +217,12 @@ impl PtyChild {
         }
     }
 
+    /// Check if process is still alive (non-mutating, does not cache result).
+    pub fn is_process_alive(&self) -> bool {
+        let result = unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) };
+        result != WAIT_OBJECT_0
+    }
+
     pub fn try_wait(&mut self) -> PtyResult<Option<i32>> {
         if self.exited {
             return Ok(self.exit_code);

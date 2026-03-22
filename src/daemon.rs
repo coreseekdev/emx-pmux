@@ -172,8 +172,14 @@ fn dispatch(msg: Message, mgr: &mut SessionManager) -> (Message, bool) {
 
         Message::ViewScreen { name } => match mgr.view(&name) {
             Ok(content) => {
-                pmux_log!("dispatch: ViewScreen({}) → {} bytes", name, content.len());
-                (Message::ScreenData { content }, false)
+                let alive = mgr.is_alive(&name).unwrap_or(false);
+                pmux_log!("dispatch: ViewScreen({}) → {} bytes, alive={}", name, content.len(), alive);
+                if alive {
+                    (Message::ScreenData { content }, false)
+                } else {
+                    // Session child exited — tell the client so it can detach.
+                    (Message::Error { message: format!("session '{}' exited", name) }, false)
+                }
             }
             Err(e) => (Message::Error { message: e }, false),
         },
