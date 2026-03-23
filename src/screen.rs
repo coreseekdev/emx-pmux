@@ -22,9 +22,11 @@ impl Default for Cell {
 }
 
 /// Cell attributes (basic SGR).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellAttr {
     pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
     pub fg: Color,
@@ -181,7 +183,7 @@ impl Screen {
         line.trim_end().to_string()
     }
 
-    /// Get all visible text as a string.
+    /// Get all visible text as a string (plain, no SGR).
     pub fn text(&self) -> String {
         // Pre-allocate: rough upper bound is rows * (cols + 1 newline)
         let mut result = String::with_capacity(self.rows as usize * (self.cols as usize + 1));
@@ -200,6 +202,60 @@ impl Screen {
                     result.push('\n');
                 }
                 result.push_str(&line);
+            }
+        }
+        result
+    }
+
+    /// Render screen content as a string with ANSI/SGR escape sequences.
+    ///
+    /// Unlike `text()`, this preserves colors and attributes (bold, dim,
+    /// underline, inverse, fg/bg colors) so that e.g. PowerShell's
+    /// PSReadLine inline predictions remain visually distinct.
+    pub fn render_ansi(&self) -> String {
+        let cols = self.cols as usize;
+        let default_attr = CellAttr::default();
+        // Generous pre-alloc: text + some SGR overhead per line.
+        let mut result = String::with_capacity(self.rows as usize * (cols + 32));
+        let mut trailing_empty = 0usize;
+
+        for row in 0..self.rows {
+            let start = row as usize * cols;
+            let end = start + cols;
+            let cells = &self.cells[start..end];
+
+            // Find rightmost cell that is non-trivial (non-space or has attrs).
+            let last_content = cells
+                .iter()
+                .rposition(|c| c.ch != ' ' || c.attr != default_attr)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+
+            if last_content == 0 {
+                trailing_empty += 1;
+                continue;
+            }
+
+            // Flush buffered empty lines.
+            for _ in 0..trailing_empty {
+                result.push('\n');
+            }
+            trailing_empty = 0;
+            if !result.is_empty() {
+                result.push('\n');
+            }
+
+            let mut cur_attr = default_attr;
+            for cell in &cells[..last_content] {
+                if cell.attr != cur_attr {
+                    result.push_str(&sgr_sequence(&cell.attr));
+                    cur_attr = cell.attr;
+                }
+                result.push(cell.ch);
+            }
+            // Reset at end of line if we changed attrs.
+            if cur_attr != default_attr {
+                result.push_str("\x1b[0m");
             }
         }
         result
@@ -414,9 +470,12 @@ impl<'a> ScreenPerformer<'a> {
                     match p {
                         0 => *self.attr = CellAttr::default(),
                         1 => self.attr.bold = true,
+                        2 => self.attr.dim = true,
+                        3 => self.attr.italic = true,
                         4 => self.attr.underline = true,
                         7 => self.attr.inverse = true,
-                        22 => self.attr.bold = false,
+                        22 => { self.attr.bold = false; self.attr.dim = false; }
+                        23 => self.attr.italic = false,
                         24 => self.attr.underline = false,
                         27 => self.attr.inverse = false,
                         30..=37 => self.attr.fg = Color::Index((p - 30) as u8),
@@ -772,6 +831,50 @@ impl<'a> Perform for ScreenPerformer<'a> {
     }
 }
 
+/// Build an SGR escape sequence that sets the given attributes from a
+/// reset state.  E.g. bold + red foreground → `\x1b[0;1;31m`.
+fn sgr_sequence(attr: &CellAttr) -> String {
+    use std::fmt::Write;
+
+    if *attr == CellAttr::default() {
+        return "\x1b[0m".to_string();
+    }
+
+    let mut seq = String::with_capacity(24);
+    seq.push_str("\x1b[0");
+    if attr.bold {
+        seq.push_str(";1");
+    }
+    if attr.dim {
+        seq.push_str(";2");
+    }
+    if attr.italic {
+        seq.push_str(";3");
+    }
+    if attr.underline {
+        seq.push_str(";4");
+    }
+    if attr.inverse {
+        seq.push_str(";7");
+    }
+    match attr.fg {
+        Color::Default => {}
+        Color::Index(n) if n < 8 => { let _ = write!(seq, ";{}", 30 + n); }
+        Color::Index(n) if n < 16 => { let _ = write!(seq, ";{}", 90 + n - 8); }
+        Color::Index(n) => { let _ = write!(seq, ";38;5;{}", n); }
+        Color::Rgb(r, g, b) => { let _ = write!(seq, ";38;2;{};{};{}", r, g, b); }
+    }
+    match attr.bg {
+        Color::Default => {}
+        Color::Index(n) if n < 8 => { let _ = write!(seq, ";{}", 40 + n); }
+        Color::Index(n) if n < 16 => { let _ = write!(seq, ";{}", 100 + n - 8); }
+        Color::Index(n) => { let _ = write!(seq, ";48;5;{}", n); }
+        Color::Rgb(r, g, b) => { let _ = write!(seq, ";48;2;{};{};{}", r, g, b); }
+    }
+    seq.push('m');
+    seq
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +989,64 @@ mod tests {
         // OSC 0; title ST
         screen.feed(b"\x1b]0;My Window\x1b\\");
         assert_eq!(screen.title, "My Window");
+    }
+
+    #[test]
+    fn render_ansi_plain() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"Hello");
+        // No attributes → render_ansi should equal text()
+        assert_eq!(screen.render_ansi(), "Hello");
+    }
+
+    #[test]
+    fn render_ansi_colors() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"\x1b[31mRed\x1b[0mNormal");
+        let ansi = screen.render_ansi();
+        // Should contain SGR for red fg, then reset, then "Normal"
+        assert!(ansi.contains("\x1b[0;31m"), "expected red SGR in: {}", ansi);
+        assert!(ansi.contains("Red"));
+        assert!(ansi.contains("Normal"));
+    }
+
+    #[test]
+    fn render_ansi_dim() {
+        let mut screen = Screen::new(80, 24);
+        // Simulate PSReadLine-like: "Get-Ch" normal + "ildItem" dim
+        screen.feed(b"Get-Ch\x1b[2mildItem\x1b[0m");
+        let ansi = screen.render_ansi();
+        assert!(ansi.contains("Get-Ch"), "expected plain prefix");
+        assert!(ansi.contains("\x1b[0;2m"), "expected dim SGR in: {}", ansi);
+        assert!(ansi.contains("ildItem"));
+    }
+
+    #[test]
+    fn sgr_dim_parse() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"\x1b[2mDim\x1b[22mNormal");
+        assert!(screen.cell(0, 0).attr.dim);
+        assert!(!screen.cell(0, 0).attr.bold);
+        // SGR 22 resets both bold and dim
+        assert!(!screen.cell(3, 0).attr.dim);
+        assert!(!screen.cell(3, 0).attr.bold);
+    }
+
+    #[test]
+    fn sgr_sequence_helper() {
+        let default = CellAttr::default();
+        assert_eq!(sgr_sequence(&default), "\x1b[0m");
+
+        let bold = CellAttr { bold: true, ..default };
+        assert_eq!(sgr_sequence(&bold), "\x1b[0;1m");
+
+        let dim_red = CellAttr { dim: true, fg: Color::Index(1), ..default };
+        assert_eq!(sgr_sequence(&dim_red), "\x1b[0;2;31m");
+
+        let bright_fg = CellAttr { fg: Color::Index(10), ..default };
+        assert_eq!(sgr_sequence(&bright_fg), "\x1b[0;92m");
+
+        let rgb_bg = CellAttr { bg: Color::Rgb(0, 128, 255), ..default };
+        assert_eq!(sgr_sequence(&rgb_bg), "\x1b[0;48;2;0;128;255m");
     }
 }

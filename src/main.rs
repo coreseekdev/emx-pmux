@@ -159,7 +159,7 @@ async fn run_view(args: &Args) -> Result<(), String> {
         .ok_or_else(|| "session name required (use -S)".to_string())?;
     let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
     match resp {
-        Message::ScreenData { content } => {
+        Message::ScreenData { content, .. } => {
             println!("{}", content);
             Ok(())
         }
@@ -185,10 +185,10 @@ async fn run_resume(args: &Args) -> Result<(), String> {
 
     // Verify session exists by fetching initial screen content.
     let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
-    let initial = match resp {
-        Message::ScreenData { content } => {
+    let (initial, init_cursor) = match resp {
+        Message::ScreenData { content, cursor_col, cursor_row } => {
             pmux_log!("resume: initial screen len={}", content.len());
-            content
+            (content, (cursor_col, cursor_row))
         }
         Message::Error { message } => return Err(message),
         _ => return Err("unexpected response".into()),
@@ -198,7 +198,7 @@ async fn run_resume(args: &Args) -> Result<(), String> {
     let saved = terminal::enable_raw_mode()
         .map_err(|e| format!("failed to enable raw mode: {}", e))?;
 
-    let result = attach_loop(name, &initial).await;
+    let result = attach_loop(name, &initial, init_cursor).await;
 
     // Always restore terminal state.
     let _ = terminal::disable_raw_mode(&saved);
@@ -216,13 +216,14 @@ async fn run_resume(args: &Args) -> Result<(), String> {
 }
 
 /// Main attach loop: forward stdin → PTY, poll screen → stdout.
-async fn attach_loop(name: &str, initial: &str) -> Result<(), String> {
+async fn attach_loop(name: &str, initial: &str, initial_cursor: (u16, u16)) -> Result<(), String> {
     let mut stdout = tokio::io::stdout();
 
     // Clear screen and render initial content.
-    render_screen(&mut stdout, initial).await?;
+    render_screen(&mut stdout, initial, initial_cursor).await?;
 
     let mut last_content = initial.to_string();
+    let mut last_cursor = initial_cursor;
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 1024];
     let mut ctrl_a_pending = false;
@@ -276,11 +277,13 @@ async fn attach_loop(name: &str, initial: &str) -> Result<(), String> {
 
             _ = refresh.tick() => {
                 match rpc(&Message::ViewScreen { name: name.to_string() }).await {
-                    Ok(Message::ScreenData { content }) => {
-                        if content != last_content {
+                    Ok(Message::ScreenData { content, cursor_col, cursor_row }) => {
+                        let cursor = (cursor_col, cursor_row);
+                        if content != last_content || cursor != last_cursor {
                             pmux_log!("attach: screen changed, len={}", content.len());
-                            render_screen(&mut stdout, &content).await?;
+                            render_screen(&mut stdout, &content, cursor).await?;
                             last_content = content;
+                            last_cursor = cursor;
                         }
                     }
                     Ok(Message::Error { message }) => {
@@ -299,17 +302,24 @@ async fn attach_loop(name: &str, initial: &str) -> Result<(), String> {
 }
 
 /// Render screen content to stdout using ANSI positioning.
-async fn render_screen(stdout: &mut tokio::io::Stdout, content: &str) -> Result<(), String> {
+async fn render_screen(stdout: &mut tokio::io::Stdout, content: &str, cursor: (u16, u16)) -> Result<(), String> {
+    use std::fmt::Write as _;
     let mut buf = Vec::with_capacity(content.len() + 256);
+    buf.extend_from_slice(b"\x1b[0m"); // reset SGR state
     buf.extend_from_slice(b"\x1b[H"); // cursor home
     for (i, line) in content.split('\n').enumerate() {
         if i > 0 {
             buf.extend_from_slice(b"\r\n");
         }
         buf.extend_from_slice(line.as_bytes());
+        buf.extend_from_slice(b"\x1b[0m"); // reset SGR before erase
         buf.extend_from_slice(b"\x1b[K"); // clear to end of line
     }
     buf.extend_from_slice(b"\x1b[J"); // clear below
+    // Position cursor at the actual terminal cursor location.
+    let mut cup = String::with_capacity(12);
+    let _ = write!(cup, "\x1b[{};{}H", cursor.1 + 1, cursor.0 + 1);
+    buf.extend_from_slice(cup.as_bytes());
     stdout.write_all(&buf).await.map_err(|e| format!("write: {}", e))?;
     stdout.flush().await.map_err(|e| format!("flush: {}", e))?;
     Ok(())
@@ -363,7 +373,7 @@ async fn run_exec(args: &Args) -> Result<(), String> {
             args: vec!["view".into()],
         }).await?;
         return match resp {
-            Message::ScreenData { content } => {
+            Message::ScreenData { content, .. } => {
                 if file == "-" {
                     println!("{}", content);
                 } else {
@@ -386,7 +396,7 @@ async fn run_exec(args: &Args) -> Result<(), String> {
 
     match resp {
         Message::Ok => Ok(()),
-        Message::ScreenData { content } => {
+        Message::ScreenData { content, .. } => {
             println!("{}", content);
             Ok(())
         }

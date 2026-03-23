@@ -11,6 +11,30 @@ use crate::pmux_log;
 use crate::pty::{self, PtyChild, PtyConfig, PtyMaster, PtyReader, PtyResult, WindowSize};
 use crate::screen::Screen;
 
+/// Split a Windows command-line argument string into Vec<String>.
+/// Simple split on whitespace; handles double-quoted segments.
+#[cfg(windows)]
+fn shell_words_windows(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quote = false;
+    for ch in s.chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            ' ' | '\t' if !in_quote => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 /// A single session: owns a PTY and a screen buffer.
 pub struct Session {
     pub name: String,
@@ -108,6 +132,11 @@ impl Session {
     /// Get current screen content as text.
     pub fn screen_text(&self) -> String {
         self.screen.lock().unwrap().text()
+    }
+
+    /// Get current screen content with ANSI/SGR attributes.
+    pub fn screen_ansi(&self) -> String {
+        self.screen.lock().unwrap().render_ansi()
     }
 
     /// Get cursor position (col, row).
@@ -208,17 +237,36 @@ impl SessionManager {
 
         let mut config = PtyConfig::default();
         if let Some(cmd) = command {
-            // Wrap the command in a shell so compound commands work
-            // (e.g. "tail -f /var/log/syslog" or "echo hello && sleep 1")
             #[cfg(unix)]
             {
                 config.args = vec!["-c".to_string(), cmd];
-                // Keep config.program as default shell ($SHELL or /bin/sh)
             }
             #[cfg(windows)]
             {
-                config.program = "cmd.exe".to_string();
-                config.args = vec!["/c".to_string(), cmd];
+                // If the command looks like a direct executable (no spaces or
+                // it's a known shell), run it directly. Otherwise wrap in
+                // cmd.exe /c for compound commands.
+                let trimmed = cmd.trim();
+                let lower = trimmed.to_lowercase();
+                if lower == "powershell.exe"
+                    || lower == "powershell"
+                    || lower == "pwsh.exe"
+                    || lower == "pwsh"
+                    || lower.starts_with("powershell.exe ")
+                    || lower.starts_with("powershell ")
+                    || lower.starts_with("pwsh.exe ")
+                    || lower.starts_with("pwsh ")
+                {
+                    // Launch PowerShell directly so it gets a proper console
+                    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+                    config.program = parts[0].to_string();
+                    if parts.len() > 1 {
+                        config.args = shell_words_windows(parts[1]);
+                    }
+                } else {
+                    config.program = "cmd.exe".to_string();
+                    config.args = vec!["/c".to_string(), cmd];
+                }
             }
         }
         config.size = WindowSize::new(cols, rows);
@@ -260,6 +308,14 @@ impl SessionManager {
     pub fn view(&self, name: &str) -> Result<String, String> {
         match self.sessions.get(name) {
             Some(s) => Ok(s.screen_text()),
+            None => Err(format!("Session '{}' not found", name)),
+        }
+    }
+
+    /// Get screen content of a session with ANSI/SGR attributes.
+    pub fn view_ansi(&self, name: &str) -> Result<String, String> {
+        match self.sessions.get(name) {
+            Some(s) => Ok(s.screen_ansi()),
             None => Err(format!("Session '{}' not found", name)),
         }
     }

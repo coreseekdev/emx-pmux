@@ -164,8 +164,8 @@ pub enum Message {
     /// MSG_SESSION_LIST: List of session info.
     SessionList { sessions: Vec<SessionInfo> },
 
-    /// MSG_SCREEN_DATA: Screen buffer content as raw UTF-8 bytes.
-    ScreenData { content: String },
+    /// MSG_SCREEN_DATA: Screen buffer content with cursor position.
+    ScreenData { content: String, cursor_col: u16, cursor_row: u16 },
 
     /// MSG_PONG: Reply to Ping.
     Pong,
@@ -319,9 +319,13 @@ fn encode(msg: &Message) -> std::io::Result<(i32, Vec<u8>)> {
             }
             Ok((MSG_SESSION_LIST, p))
         }
-        Message::ScreenData { content } => {
-            // Raw UTF-8
-            Ok((MSG_SCREEN_DATA, content.as_bytes().to_vec()))
+        Message::ScreenData { content, cursor_col, cursor_row } => {
+            // UTF-8 content + cursor position (4 bytes)
+            let mut p = Vec::with_capacity(content.len() + 4);
+            p.extend_from_slice(content.as_bytes());
+            p.extend_from_slice(&cursor_col.to_le_bytes());
+            p.extend_from_slice(&cursor_row.to_le_bytes());
+            Ok((MSG_SCREEN_DATA, p))
         }
         Message::Pong => Ok((MSG_PONG, Vec::new())),
     }
@@ -413,10 +417,16 @@ fn decode(msg_type: i32, payload: &[u8]) -> std::io::Result<Message> {
             Ok(Message::SessionList { sessions })
         }
         MSG_SCREEN_DATA => {
-            let content = std::str::from_utf8(payload)
+            if payload.len() < 4 {
+                return Err(proto_err("screen data too short"));
+            }
+            let cursor_bytes = &payload[payload.len() - 4..];
+            let cursor_col = u16::from_le_bytes([cursor_bytes[0], cursor_bytes[1]]);
+            let cursor_row = u16::from_le_bytes([cursor_bytes[2], cursor_bytes[3]]);
+            let content = std::str::from_utf8(&payload[..payload.len() - 4])
                 .map_err(|_| proto_err("invalid UTF-8 in screen data"))?
                 .to_string();
-            Ok(Message::ScreenData { content })
+            Ok(Message::ScreenData { content, cursor_col, cursor_row })
         }
         MSG_PONG => Ok(Message::Pong),
 
@@ -573,7 +583,7 @@ mod tests {
                     },
                 ],
             },
-            Message::ScreenData { content: "$ hello\nworld".into() },
+            Message::ScreenData { content: "$ hello\nworld".into(), cursor_col: 7, cursor_row: 1 },
             Message::Pong,
         ];
 
@@ -700,8 +710,11 @@ mod tests {
                     assert_eq!(a.alive, b.alive);
                 }
             }
-            (Message::ScreenData { content: c1 }, Message::ScreenData { content: c2 }) => {
+            (Message::ScreenData { content: c1, cursor_col: cc1, cursor_row: cr1 },
+             Message::ScreenData { content: c2, cursor_col: cc2, cursor_row: cr2 }) => {
                 assert_eq!(c1, c2);
+                assert_eq!(cc1, cc2);
+                assert_eq!(cr1, cr2);
             }
             (Message::Pong, Message::Pong) => {}
             _ => panic!("message variant mismatch: {:?} vs {:?}", a, b),

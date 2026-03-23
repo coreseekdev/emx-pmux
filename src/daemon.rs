@@ -170,12 +170,13 @@ fn dispatch(msg: Message, mgr: &mut SessionManager) -> (Message, bool) {
             Err(e) => (Message::Error { message: e }, false),
         },
 
-        Message::ViewScreen { name } => match mgr.view(&name) {
+        Message::ViewScreen { name } => match mgr.view_ansi(&name) {
             Ok(content) => {
                 let alive = mgr.is_alive(&name).unwrap_or(false);
-                pmux_log!("dispatch: ViewScreen({}) → {} bytes, alive={}", name, content.len(), alive);
+                let (cursor_col, cursor_row) = mgr.cursor_pos(&name).unwrap_or((0, 0));
+                pmux_log!("dispatch: ViewScreen({}) → {} bytes, alive={}, cursor=({},{})", name, content.len(), alive, cursor_col, cursor_row);
                 if alive {
-                    (Message::ScreenData { content }, false)
+                    (Message::ScreenData { content, cursor_col, cursor_row }, false)
                 } else {
                     // Session child exited — tell the client so it can detach.
                     (Message::Error { message: format!("session '{}' exited", name) }, false)
@@ -238,7 +239,10 @@ fn dispatch_command(name: &str, args: &[String], mgr: &mut SessionManager) -> (M
             }
         }
         "view" | "hardcopy" => match mgr.view(name) {
-            Ok(content) => (Message::ScreenData { content }, false),
+            Ok(content) => {
+                let (cursor_col, cursor_row) = mgr.cursor_pos(name).unwrap_or((0, 0));
+                (Message::ScreenData { content, cursor_col, cursor_row }, false)
+            }
             Err(e) => (Message::Error { message: e }, false),
         },
         "quit" | "kill" => match mgr.kill(name) {
