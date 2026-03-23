@@ -142,14 +142,13 @@ impl Session {
                         }
                         if let Ok(mut scr) = screen.lock() {
                             scr.feed(&buf[..n]);
-                            // Write transcript directly to log, avoiding allocation.
+                            // Flush only completed transcript lines to the log.
+                            // The current (incomplete) line stays in the buffer
+                            // so shell line-editing redraws overwrite it before
+                            // it is committed.
                             if let Some(ref mut w) = log_writer {
-                                let t = scr.transcript();
-                                if !t.is_empty() {
-                                    let _ = w.write_all(t);
-                                    let _ = w.flush();
-                                }
-                                scr.clear_transcript();
+                                let _ = scr.transcript_flush_lines_to(w);
+                                let _ = w.flush();
                             }
                         }
                     }
@@ -160,8 +159,11 @@ impl Session {
                     }
                 }
             }
-            // Flush log before exiting.
+            // Flush remaining transcript (including any partial line) before exiting.
             if let Some(ref mut w) = log_writer {
+                if let Ok(mut scr) = screen.lock() {
+                    let _ = scr.transcript_flush_all_to(w);
+                }
                 let _ = w.flush();
             }
             alive.store(false, Ordering::SeqCst);
@@ -170,6 +172,19 @@ impl Session {
 
     /// Write data to the PTY (e.g. user keystrokes).
     pub fn write_data(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Ok(mut scr) = self.screen.lock() {
+            // End post-alt-screen / completion / cancel suppression:
+            // user input means the shell response is over.
+            scr.clear_transcript_suppress();
+            // Tab (0x09) triggers shell completion — the partially-typed
+            // command and any completion-menu redraws should not appear.
+            // Ctrl+C (0x03) cancels the current input line.
+            // Both truncate the current line and re-set suppress until
+            // the *next* user input clears it.
+            if data.contains(&0x09) || data.contains(&0x03) {
+                scr.cancel_transcript_line();
+            }
+        }
         self.master.write_all(data)
     }
 

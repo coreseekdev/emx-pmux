@@ -75,6 +75,20 @@ pub struct Screen {
     pub title: String,
     /// Transcript buffer: captures printable text for session logging.
     transcript: Vec<u8>,
+    /// Deferred CR flag: when true, the next printable char truncates the
+    /// current transcript line (handling shell line-editing redraws).
+    /// A CR followed immediately by LF is treated as a normal line ending.
+    transcript_cr_pending: bool,
+    /// Pre-CR cursor column saved when `transcript_cr_pending` is set.
+    /// Used by the LF snapshot to trim prediction/ghost text that sits
+    /// beyond the real cursor position.
+    transcript_cr_col: u16,
+    /// Suppress transcript recording after alt-screen exit until the
+    /// repaint (ConPTY resends the main buffer) is over.  Also set by
+    /// `cancel_transcript_line()` (Tab completion, Ctrl+C) so that all
+    /// shell-internal redraws are suppressed.  Cleared externally via
+    /// `clear_transcript_suppress()` when the next user input arrives.
+    transcript_suppress: bool,
 }
 
 /// Saved state when switching to alternate screen.
@@ -118,6 +132,9 @@ impl Screen {
             alt_saved: None,
             title: String::new(),
             transcript: Vec::with_capacity(TRANSCRIPT_BUF_CAPACITY),
+            transcript_cr_pending: false,
+            transcript_cr_col: 0,
+            transcript_suppress: false,
         }
     }
 
@@ -141,6 +158,9 @@ impl Screen {
             ref mut alt_saved,
             ref mut title,
             ref mut transcript,
+            ref mut transcript_cr_pending,
+            ref mut transcript_cr_col,
+            ref mut transcript_suppress,
         } = *self;
 
         let mut performer = ScreenPerformer {
@@ -159,6 +179,9 @@ impl Screen {
             alt_saved,
             title,
             transcript,
+            transcript_cr_pending,
+            transcript_cr_col,
+            transcript_suppress,
         };
         for &byte in data {
             parser.advance(&mut performer, byte);
@@ -196,6 +219,56 @@ impl Screen {
     /// Clear transcript buffer, preserving allocated capacity.
     pub fn clear_transcript(&mut self) {
         self.transcript.clear();
+    }
+
+    /// End post-alt-screen repaint suppression.
+    ///
+    /// Called when user input arrives (e.g. `SendData`), signalling that
+    /// the ConPTY repaint is over and real output should be recorded.
+    pub fn clear_transcript_suppress(&mut self) {
+        self.transcript_suppress = false;
+    }
+
+    /// Cancel the current incomplete transcript line.
+    ///
+    /// Called when Tab or Ctrl+C is sent to the PTY — the partially-typed
+    /// command should not appear in the log.  Sets `transcript_suppress`
+    /// so that all subsequent shell redraws (completion menus, ^C echo)
+    /// are also suppressed until the next user input clears it.
+    pub fn cancel_transcript_line(&mut self) {
+        if let Some(pos) = self.transcript.iter().rposition(|&b| b == b'\n') {
+            self.transcript.truncate(pos + 1);
+        } else {
+            self.transcript.clear();
+        }
+        self.transcript_cr_pending = false;
+        self.transcript_suppress = true;
+    }
+
+    /// Flush completed transcript lines (up to the last `\n`) to `w`,
+    /// keeping the current incomplete line in the buffer for possible
+    /// editing/rewriting by the shell.
+    pub fn transcript_flush_lines_to(
+        &mut self,
+        w: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        if let Some(pos) = self.transcript.iter().rposition(|&b| b == b'\n') {
+            w.write_all(&self.transcript[..=pos])?;
+            self.transcript.drain(..=pos);
+        }
+        Ok(())
+    }
+
+    /// Flush any remaining transcript content (e.g. at session end).
+    pub fn transcript_flush_all_to(
+        &mut self,
+        w: &mut impl std::io::Write,
+    ) -> std::io::Result<()> {
+        if !self.transcript.is_empty() {
+            w.write_all(&self.transcript)?;
+            self.transcript.clear();
+        }
+        Ok(())
     }
 
     /// Get one line as a string (trimming trailing spaces).
@@ -363,6 +436,9 @@ struct ScreenPerformer<'a> {
     alt_saved: &'a mut Option<AltSaved>,
     title: &'a mut String,
     transcript: &'a mut Vec<u8>,
+    transcript_cr_pending: &'a mut bool,
+    transcript_cr_col: &'a mut u16,
+    transcript_suppress: &'a mut bool,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -556,6 +632,23 @@ impl<'a> ScreenPerformer<'a> {
 impl<'a> Perform for ScreenPerformer<'a> {
     fn print(&mut self, ch: char) {
         self.put_char(ch);
+        // Don't record to transcript while on alternate screen (pagers, editors),
+        // during post-alt-screen repaint, or when the current cell has dim
+        // attributes (PSReadLine inline predictions are rendered dimly).
+        if *self.alt_active || *self.transcript_suppress || self.attr.dim {
+            return;
+        }
+        // If CR was pending, the shell is redrawing the current line.
+        // Truncate transcript back to the start of the current line so
+        // the redrawn content replaces (rather than appends to) the old.
+        if *self.transcript_cr_pending {
+            if let Some(pos) = self.transcript.iter().rposition(|&b| b == b'\n') {
+                self.transcript.truncate(pos + 1);
+            } else {
+                self.transcript.clear();
+            }
+            *self.transcript_cr_pending = false;
+        }
         // Transcript: record printable characters.
         let mut buf = [0u8; 4];
         self.transcript.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -564,28 +657,90 @@ impl<'a> Perform for ScreenPerformer<'a> {
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' | 0x0b | 0x0c => {
-                // LF, VT, FF
+                let mut trimmed = 0usize;
+                if !*self.alt_active && !*self.transcript_suppress {
+                    // Snapshot screen line content before scroll, replacing the
+                    // transcript's current line.  This ensures prediction/redraw
+                    // artifacts are excluded — only what the screen actually shows
+                    // at commit time gets logged.
+                    let row = *self.cursor_y as usize;
+                    let cols = self.cols as usize;
+                    let start = row * cols;
+                    let end = (start + cols).min(self.cells.len());
+                    // When CR (or CSI G to col 0) preceded this LF, the saved
+                    // pre-CR cursor column marks where real content ends and
+                    // prediction / ghost text begins.  Trim within that boundary.
+                    let scan_end = if *self.transcript_cr_pending {
+                        let cr_col = (*self.transcript_cr_col as usize).min(end - start);
+                        start + cr_col
+                    } else {
+                        end
+                    };
+                    trimmed = self.cells[start..scan_end]
+                        .iter()
+                        .rposition(|c| c.ch != ' ')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    // Exclude trailing dim cells (PSReadLine inline prediction).
+                    while trimmed > 0 && self.cells[start + trimmed - 1].attr.dim {
+                        trimmed -= 1;
+                    }
+                    let line_start = self.transcript.iter()
+                        .rposition(|&b| b == b'\n')
+                        .map(|p| p + 1)
+                        .unwrap_or(0);
+                    self.transcript.truncate(line_start);
+                    for cell in &self.cells[start..start + trimmed] {
+                        let mut buf = [0u8; 4];
+                        self.transcript
+                            .extend_from_slice(cell.ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
                 self.line_feed();
-                self.transcript.push(b'\n');
+                if !*self.alt_active && !*self.transcript_suppress {
+                    *self.transcript_cr_pending = false;
+                    // Suppress \n when the snapshot was empty and the
+                    // transcript already ends with \n\n — prevents runs
+                    // of blank lines from clear/scroll operations while
+                    // allowing at most one blank line in output.
+                    let suppress_blank = trimmed == 0 && {
+                        let len = self.transcript.len();
+                        len >= 2
+                            && self.transcript[len - 1] == b'\n'
+                            && self.transcript[len - 2] == b'\n'
+                    };
+                    if !suppress_blank {
+                        self.transcript.push(b'\n');
+                    }
+                }
             }
             b'\r' => {
+                if !*self.alt_active && !*self.transcript_suppress {
+                    *self.transcript_cr_col = *self.cursor_x;
+                    *self.transcript_cr_pending = true;
+                }
                 *self.cursor_x = 0;
             }
             b'\t' => {
-                // Tab: move to next 8-column boundary
                 let next = (*self.cursor_x / TAB_WIDTH + 1) * TAB_WIDTH;
                 *self.cursor_x = next.min(self.cols.saturating_sub(1));
-                self.transcript.push(b'\t');
+                if !*self.alt_active && !*self.transcript_suppress {
+                    self.transcript.push(b'\t');
+                }
             }
             0x08 => {
-                // Backspace
                 if *self.cursor_x > 0 {
                     *self.cursor_x -= 1;
                 }
+                if !*self.alt_active && !*self.transcript_suppress {
+                    if let Some(&last) = self.transcript.last() {
+                        if last != b'\n' {
+                            self.transcript.pop();
+                        }
+                    }
+                }
             }
-            0x07 => {
-                // Bell - ignore
-            }
+            0x07 => {}
             _ => {}
         }
     }
@@ -618,6 +773,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                             *self.cursor_x = 0;
                             *self.cursor_y = 0;
                             *self.alt_active = true;
+                            *self.transcript_cr_pending = false;
                         } else if !set && *self.alt_active {
                             if let Some(saved) = self.alt_saved.take() {
                                 *self.cells = saved.cells;
@@ -628,6 +784,10 @@ impl<'a> Perform for ScreenPerformer<'a> {
                                 *self.scroll_bottom = saved.scroll_bottom;
                             }
                             *self.alt_active = false;
+                            // Suppress transcript until repaint is done;
+                            // ConPTY will resend the main buffer contents.
+                            *self.transcript_suppress = true;
+                            *self.transcript_cr_pending = false;
                         }
                     }
                     47 | 1047 => {
@@ -646,6 +806,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                                 scroll_bottom: *self.scroll_bottom,
                             });
                             *self.alt_active = true;
+                            *self.transcript_cr_pending = false;
                         } else if !set && *self.alt_active {
                             if let Some(saved) = self.alt_saved.take() {
                                 *self.cells = saved.cells;
@@ -653,6 +814,8 @@ impl<'a> Perform for ScreenPerformer<'a> {
                                 *self.scroll_bottom = saved.scroll_bottom;
                             }
                             *self.alt_active = false;
+                            *self.transcript_suppress = true;
+                            *self.transcript_cr_pending = false;
                         }
                     }
                     _ => {} // ignore other DEC modes
@@ -701,14 +864,30 @@ impl<'a> Perform for ScreenPerformer<'a> {
             'G' | '`' => {
                 // Cursor Horizontal Absolute
                 let n = p(0, 1);
-                *self.cursor_x = (n.saturating_sub(1)).min(self.cols.saturating_sub(1));
+                let new_x = (n.saturating_sub(1)).min(self.cols.saturating_sub(1));
+                // Moving to column 0 is equivalent to CR for transcript.
+                if !*self.alt_active && !*self.transcript_suppress && new_x == 0 {
+                    *self.transcript_cr_col = *self.cursor_x;
+                    *self.transcript_cr_pending = true;
+                }
+                *self.cursor_x = new_x;
             }
             'H' | 'f' => {
                 // Cursor Position
                 let row = p(0, 1);
                 let col = p(1, 1);
-                *self.cursor_y = (row.saturating_sub(1)).min(self.rows.saturating_sub(1));
-                *self.cursor_x = (col.saturating_sub(1)).min(self.cols.saturating_sub(1));
+                let old_y = *self.cursor_y;
+                let old_x = *self.cursor_x;
+                let new_y = (row.saturating_sub(1)).min(self.rows.saturating_sub(1));
+                let new_x = (col.saturating_sub(1)).min(self.cols.saturating_sub(1));
+                *self.cursor_y = new_y;
+                *self.cursor_x = new_x;
+                if !*self.alt_active && !*self.transcript_suppress {
+                    if new_y == old_y && new_x == 0 {
+                        *self.transcript_cr_col = old_x;
+                        *self.transcript_cr_pending = true;
+                    }
+                }
             }
             'J' => {
                 // Erase in Display
@@ -716,7 +895,33 @@ impl<'a> Perform for ScreenPerformer<'a> {
             }
             'K' => {
                 // Erase in Line
-                self.erase_in_line(p(0, 0));
+                let mode = p(0, 0);
+                self.erase_in_line(mode);
+                // Transcript: reflect the erase by truncating the current line.
+                if !*self.alt_active && !*self.transcript_suppress {
+                    match mode {
+                        0 => {
+                            // Erase cursor → end: keep only cursor_x chars on current line.
+                            let line_start = self.transcript.iter()
+                                .rposition(|&b| b == b'\n')
+                                .map(|p| p + 1)
+                                .unwrap_or(0);
+                            let target = *self.cursor_x as usize;
+                            if self.transcript.len() - line_start > target {
+                                self.transcript.truncate(line_start + target);
+                            }
+                        }
+                        2 => {
+                            // Erase entire line.
+                            let line_start = self.transcript.iter()
+                                .rposition(|&b| b == b'\n')
+                                .map(|p| p + 1)
+                                .unwrap_or(0);
+                            self.transcript.truncate(line_start);
+                        }
+                        _ => {}
+                    }
+                }
             }
             'L' => {
                 // Insert Lines: push lines down from cursor_y within scroll region

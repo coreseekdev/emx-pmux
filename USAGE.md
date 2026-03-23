@@ -255,7 +255,7 @@ pmux -X -S auto quit
 | Variable | Description |
 |----------|-------------|
 | `EMX_PMUX_LOG_SESSION_PATH` | Directory for session transcript logs. When set to an existing directory, each session writes a `<name>.log` file containing the full interaction text (prompts, commands, output) with escape sequences stripped. |
-| `EMX_TMUX_LOG` | Debug log file path (internal diagnostics). |
+| `EMX_PMUX_LOG` | Debug log file path (internal diagnostics). |
 
 ### Session Logging
 
