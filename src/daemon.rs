@@ -6,6 +6,7 @@
 
 use std::io;
 
+use crate::consts::REAP_INTERVAL_SECS;
 use crate::ipc::{self, Message};
 use crate::platform;
 use crate::pmux_log;
@@ -17,7 +18,7 @@ pub async fn run() -> io::Result<()> {
     platform::write_pid_file()?;
     let mut mgr = SessionManager::new();
     let mut had_sessions = false;
-    let mut reap_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut reap_interval = tokio::time::interval(std::time::Duration::from_secs(REAP_INTERVAL_SECS));
 
     #[cfg(unix)]
     {

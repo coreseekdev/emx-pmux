@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
+use crate::consts::{ENV_SESSION_LOG_PATH, PTY_READ_BUF_SIZE};
 use crate::pmux_log;
 use crate::pty::{self, PtyChild, PtyConfig, PtyMaster, PtyReader, PtyResult, WindowSize};
 use crate::screen::Screen;
@@ -40,7 +41,7 @@ fn shell_words_windows(s: &str) -> Vec<String> {
 /// Returns the session log directory if `EMX_PMUX_LOG_SESSION_PATH` is set
 /// and points to an existing directory.
 fn session_log_dir() -> Option<PathBuf> {
-    let val = std::env::var("EMX_PMUX_LOG_SESSION_PATH").ok()?;
+    let val = std::env::var(ENV_SESSION_LOG_PATH).ok()?;
     let path = PathBuf::from(val);
     if fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
         Some(path)
@@ -124,7 +125,7 @@ impl Session {
                 }
             });
 
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; PTY_READ_BUF_SIZE];
             let mut total = 0usize;
             loop {
                 match reader.read(&mut buf) {
@@ -141,13 +142,14 @@ impl Session {
                         }
                         if let Ok(mut scr) = screen.lock() {
                             scr.feed(&buf[..n]);
-                            // Drain transcript and write to session log.
+                            // Write transcript directly to log, avoiding allocation.
                             if let Some(ref mut w) = log_writer {
-                                let transcript = scr.drain_transcript();
-                                if !transcript.is_empty() {
-                                    let _ = w.write_all(&transcript);
+                                let t = scr.transcript();
+                                if !t.is_empty() {
+                                    let _ = w.write_all(t);
                                     let _ = w.flush();
                                 }
+                                scr.clear_transcript();
                             }
                         }
                     }
@@ -173,28 +175,28 @@ impl Session {
 
     /// Get current screen content as text.
     pub fn screen_text(&self) -> String {
-        self.screen.lock().unwrap().text()
+        self.screen.lock().expect("screen mutex poisoned").text()
     }
 
     /// Get current screen content with ANSI/SGR attributes.
     pub fn screen_ansi(&self) -> String {
-        self.screen.lock().unwrap().render_ansi()
+        self.screen.lock().expect("screen mutex poisoned").render_ansi()
     }
 
     /// Get cursor position (col, row).
     pub fn cursor_pos(&self) -> (u16, u16) {
-        self.screen.lock().unwrap().cursor()
+        self.screen.lock().expect("screen mutex poisoned").cursor()
     }
 
     /// Get screen size.
     pub fn screen_size(&self) -> (u16, u16) {
-        self.screen.lock().unwrap().size()
+        self.screen.lock().expect("screen mutex poisoned").size()
     }
 
     /// Resize PTY and screen.
     pub fn resize(&mut self, cols: u16, rows: u16) -> PtyResult<()> {
         self.master.resize(WindowSize::new(cols, rows))?;
-        self.screen.lock().unwrap().resize(cols, rows);
+        self.screen.lock().expect("screen mutex poisoned").resize(cols, rows);
         Ok(())
     }
 
@@ -245,6 +247,10 @@ pub struct SessionInfo {
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     next_id: u32,
+}
+
+fn session_not_found(name: &str) -> String {
+    format!("Session '{}' not found", name)
 }
 
 impl SessionManager {
@@ -327,7 +333,7 @@ impl SessionManager {
                 s.kill();
                 Ok(())
             }
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 
@@ -342,7 +348,7 @@ impl SessionManager {
             Some(s) => s
                 .write_data(data)
                 .map_err(|e| format!("Write failed: {}", e)),
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 
@@ -350,7 +356,7 @@ impl SessionManager {
     pub fn view(&self, name: &str) -> Result<String, String> {
         match self.sessions.get(name) {
             Some(s) => Ok(s.screen_text()),
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 
@@ -358,7 +364,7 @@ impl SessionManager {
     pub fn view_ansi(&self, name: &str) -> Result<String, String> {
         match self.sessions.get(name) {
             Some(s) => Ok(s.screen_ansi()),
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 
@@ -371,7 +377,7 @@ impl SessionManager {
     pub fn cursor_pos(&self, name: &str) -> Result<(u16, u16), String> {
         match self.sessions.get(name) {
             Some(s) => Ok(s.cursor_pos()),
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 
@@ -379,7 +385,7 @@ impl SessionManager {
     pub fn resize(&mut self, name: &str, cols: u16, rows: u16) -> Result<(), String> {
         match self.sessions.get_mut(name) {
             Some(s) => s.resize(cols, rows).map_err(|e| format!("Resize failed: {}", e)),
-            None => Err(format!("Session '{}' not found", name)),
+            None => Err(session_not_found(name)),
         }
     }
 

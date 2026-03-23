@@ -1,5 +1,8 @@
 use clap::Parser;
 use pmux::cli::{Args, Mode};
+use pmux::consts::{
+    ATTACH_REFRESH_MS, DEFAULT_EXPECT_TIMEOUT_MS, EXPECT_POLL_MS, STDIN_BUF_SIZE,
+};
 use pmux::escape::unescape;
 use pmux::ipc::{self, Message};
 use pmux::platform;
@@ -157,10 +160,10 @@ async fn attach_loop(name: &str, initial: &str, initial_cursor: (u16, u16)) -> R
     let mut last_content = initial.to_string();
     let mut last_cursor = initial_cursor;
     let mut stdin = tokio::io::stdin();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; STDIN_BUF_SIZE];
     let mut ctrl_a_pending = false;
 
-    let mut refresh = tokio::time::interval(std::time::Duration::from_millis(33));
+    let mut refresh = tokio::time::interval(std::time::Duration::from_millis(ATTACH_REFRESH_MS));
     // Don't let missed ticks pile up.
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -312,16 +315,16 @@ async fn run_exec(args: &Args) -> Result<(), String> {
         let re = Regex::new(pattern)
             .map_err(|e| format!("invalid regex '{}': {}", pattern, e))?;
 
-        // --timeout N (ms), default 10000
+        // --timeout N (ms), default DEFAULT_EXPECT_TIMEOUT_MS
         let timeout_ms: u64 = cmd_args.iter()
             .position(|&a| a == "--timeout")
             .and_then(|i| cmd_args.get(i + 1))
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000);
+            .unwrap_or(DEFAULT_EXPECT_TIMEOUT_MS);
 
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(timeout_ms);
-        let poll = std::time::Duration::from_millis(50);
+        let poll = std::time::Duration::from_millis(EXPECT_POLL_MS);
 
         loop {
             let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;

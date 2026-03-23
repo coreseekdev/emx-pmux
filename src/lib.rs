@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod consts;
 pub mod daemon;
 pub mod escape;
 pub mod ipc;

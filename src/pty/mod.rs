@@ -6,6 +6,8 @@
 
 mod error;
 
+use crate::consts::{DEFAULT_COLS, DEFAULT_ROWS};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -33,7 +35,7 @@ impl WindowSize {
 
 impl Default for WindowSize {
     fn default() -> Self {
-        Self::new(80, 24)
+        Self::new(DEFAULT_COLS, DEFAULT_ROWS)
     }
 }
 

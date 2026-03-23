@@ -1,5 +1,6 @@
 //! Platform utilities: socket naming, daemon spawning, connection helpers.
 
+use crate::consts::{DAEMON_STARTUP_TIMEOUT_SECS, PIPE_RETRY_DELAY_MS};
 use std::io;
 
 // ── Socket naming ────────────────────────────────────────────────────
@@ -54,13 +55,13 @@ pub async fn connect_daemon() -> io::Result<tokio::net::windows::named_pipe::Nam
     let path = socket_path();
     // Retry on ERROR_PIPE_BUSY (231): the daemon is between creating
     // pipe instances, or is_daemon_running() consumed the previous one.
-    let mut attempts = 0;
+    let mut attempts: u32 = 0;
     loop {
         match tokio::net::windows::named_pipe::ClientOptions::new().open(&path) {
             Ok(client) => return Ok(client),
-            Err(e) if e.raw_os_error() == Some(231) && attempts < 20 => {
+            Err(e) if e.raw_os_error() == Some(231) && attempts < crate::consts::PIPE_RETRY_MAX_ATTEMPTS => {
                 attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(PIPE_RETRY_DELAY_MS)).await;
             }
             Err(e) => return Err(e),
         }
@@ -142,11 +143,8 @@ pub fn spawn_daemon() -> io::Result<u32> {
 
     #[cfg(windows)]
     {
+        use crate::consts::CREATE_NO_WINDOW;
         use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW (0x0800_0000): console app without a visible
-        // console window.  Do NOT combine with DETACHED_PROCESS — MSDN
-        // says the two flags are mutually exclusive.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let child = std::process::Command::new(exe)
             .arg("--daemon")
             .creation_flags(CREATE_NO_WINDOW)
@@ -177,9 +175,9 @@ pub async fn ensure_daemon() -> io::Result<()> {
     }
     spawn_daemon()?;
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(5);
+    let timeout = std::time::Duration::from_secs(DAEMON_STARTUP_TIMEOUT_SECS);
     while start.elapsed() < timeout {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(PIPE_RETRY_DELAY_MS)).await;
         if is_daemon_running() {
             return Ok(());
         }

@@ -1,16 +1,18 @@
-//! Logging controlled by EMX_TMUX_LOG environment variable.
+//! Logging controlled by EMX_PMUX_LOG environment variable.
 //!
-//! Set `EMX_TMUX_LOG=path/to/file.log` to enable file-based logging.
+//! Set `EMX_PMUX_LOG=path/to/file.log` to enable file-based logging.
 //! When unset, no logging occurs (zero overhead).
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
+use crate::consts::ENV_LOG;
+
 static LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
 fn init_log() -> Option<Mutex<File>> {
-    let path = std::env::var("EMX_TMUX_LOG").ok()?;
+    let path = std::env::var(ENV_LOG).ok()?;
     if path.is_empty() {
         return None;
     }

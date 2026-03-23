@@ -1,5 +1,6 @@
 //! CLI definitions (clap derive) - GNU screen compatible.
 
+use crate::consts::{DEFAULT_COLS, DEFAULT_ROWS};
 use clap::Parser;
 
 /// pmux - cross-platform terminal multiplexer (screen-compatible)
@@ -35,11 +36,11 @@ pub struct Args {
     pub command: Option<String>,
 
     /// Terminal width
-    #[arg(short = 'x', long, default_value_t = 80)]
+    #[arg(short = 'x', long, default_value_t = DEFAULT_COLS)]
     pub width: u16,
 
     /// Terminal height
-    #[arg(short = 'y', long, default_value_t = 24)]
+    #[arg(short = 'y', long, default_value_t = DEFAULT_ROWS)]
     pub height: u16,
 
     /// Show daemon status
