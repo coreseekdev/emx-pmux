@@ -134,6 +134,10 @@ pmux -X -S mysession hardcopy /tmp/screen.txt  # write to file
 # Resize session
 pmux -X -S mysession resize 120 40
 
+# Expect - wait for pattern to appear on screen (client-side regex poll)
+pmux -X -S mysession expect 'pattern'              # default 10s timeout
+pmux -X -S mysession expect 'pattern' --timeout 5000  # custom timeout (ms)
+
 # Quit/kill session
 pmux -X -S mysession quit
 ```
@@ -207,6 +211,24 @@ pmux -l
 pmux -r -S backup
 ```
 
+### Scripted Automation (stuff + expect)
+
+```bash
+# Create a session
+pmux -S auto -c bash
+
+# Wait for shell prompt, then run a command
+pmux -X -S auto expect '\$'              # wait for $ prompt
+pmux -X -S auto stuff "ls -la\n"          # send command
+pmux -X -S auto expect '\$'              # wait for command to finish
+
+# Capture output
+pmux -X -S auto hardcopy /tmp/output.txt
+
+# Clean up
+pmux -X -S auto quit
+```
+
 ## Comparison with GNU screen
 
 | screen command | pmux equivalent | Notes |
@@ -218,6 +240,7 @@ pmux -r -S backup
 | `screen -X -S name stuff "text"` | `pmux -X -S name stuff "text"` | Send data |
 | `screen -X -S name hardcopy file` | `pmux -X -S name hardcopy file` | Write screen to file |
 | (file required) | `pmux -X -S name hardcopy` | Write to stdout (pmux extension) |
+| (no equivalent) | `pmux -X -S name expect 'pat'` | Wait for regex match on screen |
 | `screen -X -S name quit` | `pmux -X -S name quit` | Kill session |
 | `screen -dmS name cmd` | `pmux -d -S name -c cmd` | Detached mode |
 
@@ -226,6 +249,39 @@ pmux -r -S backup
 - **Auto-generated**: `0`, `1`, `2`, ... (incremental IDs)
 - **Custom names**: Any string without spaces
 - **Uniqueness**: Custom names must be unique; creating a duplicate returns an error
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `EMX_PMUX_LOG_SESSION_PATH` | Directory for session transcript logs. When set to an existing directory, each session writes a `<name>.log` file containing the full interaction text (prompts, commands, output) with escape sequences stripped. |
+| `EMX_TMUX_LOG` | Debug log file path (internal diagnostics). |
+
+### Session Logging
+
+Session logging records the full terminal interaction transcript — everything visible on screen, with ANSI escape sequences removed.
+
+```bash
+# Enable session logging
+export EMX_PMUX_LOG_SESSION_PATH=/tmp/pmux-logs
+mkdir -p $EMX_PMUX_LOG_SESSION_PATH
+
+# Start a session (daemon inherits the env var)
+pmux -S mysession -c bash
+
+# Interact with the session
+pmux -X -S mysession stuff "echo hello\n"
+
+# Log file is written in real-time
+cat /tmp/pmux-logs/mysession.log
+```
+
+Log file format:
+- One file per session: `<session_name>.log`
+- Contains printable characters, newlines, and tabs as they appear on screen
+- Escape sequences (colors, cursor movement, etc.) are stripped
+- File is opened in append mode and flushed after each PTY read
+- The environment variable must be set **before** the daemon starts (the daemon process inherits it)
 
 ## Platform-Specific Behavior
 

@@ -1,7 +1,9 @@
 //! Session management: PTY + Screen + reader thread.
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -33,6 +35,18 @@ fn shell_words_windows(s: &str) -> Vec<String> {
         args.push(current);
     }
     args
+}
+
+/// Returns the session log directory if `EMX_PMUX_LOG_SESSION_PATH` is set
+/// and points to an existing directory.
+fn session_log_dir() -> Option<PathBuf> {
+    let val = std::env::var("EMX_PMUX_LOG_SESSION_PATH").ok()?;
+    let path = PathBuf::from(val);
+    if fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false) {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// A single session: owns a PTY and a screen buffer.
@@ -94,6 +108,22 @@ impl Session {
         let name = self.name.clone();
         thread::spawn(move || {
             pmux_log!("reader({}): started", name);
+
+            // Open session log file if EMX_PMUX_LOG_SESSION_PATH is set.
+            let mut log_writer: Option<BufWriter<fs::File>> = session_log_dir().and_then(|dir| {
+                let path = dir.join(format!("{}.log", name));
+                match OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(f) => {
+                        pmux_log!("reader({}): session log → {:?}", name, path);
+                        Some(BufWriter::new(f))
+                    }
+                    Err(e) => {
+                        pmux_log!("reader({}): failed to open session log {:?}: {}", name, path, e);
+                        None
+                    }
+                }
+            });
+
             let mut buf = [0u8; 8192];
             let mut total = 0usize;
             loop {
@@ -111,6 +141,14 @@ impl Session {
                         }
                         if let Ok(mut scr) = screen.lock() {
                             scr.feed(&buf[..n]);
+                            // Drain transcript and write to session log.
+                            if let Some(ref mut w) = log_writer {
+                                let transcript = scr.drain_transcript();
+                                if !transcript.is_empty() {
+                                    let _ = w.write_all(&transcript);
+                                    let _ = w.flush();
+                                }
+                            }
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -119,6 +157,10 @@ impl Session {
                         break;
                     }
                 }
+            }
+            // Flush log before exiting.
+            if let Some(ref mut w) = log_writer {
+                let _ = w.flush();
             }
             alive.store(false, Ordering::SeqCst);
         });

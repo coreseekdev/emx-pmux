@@ -72,6 +72,8 @@ pub struct Screen {
     alt_saved: Option<AltSaved>,
     /// Window/icon title set via OSC 0/1/2.
     pub title: String,
+    /// Transcript buffer: captures printable text for session logging.
+    transcript: Vec<u8>,
 }
 
 /// Saved state when switching to alternate screen.
@@ -114,6 +116,7 @@ impl Screen {
             alt_active: false,
             alt_saved: None,
             title: String::new(),
+            transcript: Vec::new(),
         }
     }
 
@@ -136,6 +139,7 @@ impl Screen {
             ref mut alt_active,
             ref mut alt_saved,
             ref mut title,
+            ref mut transcript,
         } = *self;
 
         let mut performer = ScreenPerformer {
@@ -153,6 +157,7 @@ impl Screen {
             alt_active,
             alt_saved,
             title,
+            transcript,
         };
         for &byte in data {
             parser.advance(&mut performer, byte);
@@ -173,6 +178,11 @@ impl Screen {
     pub fn cell(&self, col: u16, row: u16) -> &Cell {
         let idx = row as usize * self.cols as usize + col as usize;
         &self.cells[idx]
+    }
+
+    /// Drain the transcript buffer, returning accumulated text since last drain.
+    pub fn drain_transcript(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.transcript)
     }
 
     /// Get one line as a string (trimming trailing spaces).
@@ -331,6 +341,7 @@ struct ScreenPerformer<'a> {
     alt_active: &'a mut bool,
     alt_saved: &'a mut Option<AltSaved>,
     title: &'a mut String,
+    transcript: &'a mut Vec<u8>,
 }
 
 impl<'a> ScreenPerformer<'a> {
@@ -548,6 +559,9 @@ impl<'a> ScreenPerformer<'a> {
 impl<'a> Perform for ScreenPerformer<'a> {
     fn print(&mut self, ch: char) {
         self.put_char(ch);
+        // Transcript: record printable characters.
+        let mut buf = [0u8; 4];
+        self.transcript.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
     }
 
     fn execute(&mut self, byte: u8) {
@@ -555,6 +569,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
             b'\n' | 0x0b | 0x0c => {
                 // LF, VT, FF
                 self.line_feed();
+                self.transcript.push(b'\n');
             }
             b'\r' => {
                 *self.cursor_x = 0;
@@ -563,6 +578,7 @@ impl<'a> Perform for ScreenPerformer<'a> {
                 // Tab: move to next 8-column boundary
                 let next = (*self.cursor_x / 8 + 1) * 8;
                 *self.cursor_x = next.min(self.cols.saturating_sub(1));
+                self.transcript.push(b'\t');
             }
             0x08 => {
                 // Backspace
@@ -1089,5 +1105,23 @@ mod tests {
 
         let rgb_bg = CellAttr { bg: Color::Rgb(0, 128, 255), ..default };
         assert_eq!(sgr_sequence(&rgb_bg), "\x1b[0;48;2;0;128;255m");
+    }
+
+    #[test]
+    fn transcript_captures_printable_text() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"Hello\r\nWorld");
+        let t = screen.drain_transcript();
+        assert_eq!(String::from_utf8_lossy(&t), "Hello\nWorld");
+        // Second drain returns empty.
+        assert!(screen.drain_transcript().is_empty());
+    }
+
+    #[test]
+    fn transcript_ignores_escape_sequences() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"\x1b[31mRed\x1b[0m Normal\x1b[2J");
+        let t = screen.drain_transcript();
+        assert_eq!(String::from_utf8_lossy(&t), "Red Normal");
     }
 }

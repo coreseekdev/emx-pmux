@@ -5,6 +5,7 @@ use pmux::ipc::{self, Message};
 use pmux::platform;
 use pmux::pmux_log;
 use pmux::terminal;
+use regex::Regex;
 use std::process;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -298,6 +299,49 @@ async fn run_exec(args: &Args) -> Result<(), String> {
             Message::Error { message } => Err(message),
             _ => Err("unexpected response".into()),
         };
+    }
+
+    // Special case: `expect` — client-side poll + regex on --view output.
+    // No daemon/IPC changes needed; reuses MSG_VIEW_SCREEN.
+    if cmd == "expect" {
+        let cmd_args: Vec<&str> = args.command_args[1..].iter().map(|s| s.as_str()).collect();
+        if cmd_args.is_empty() {
+            return Err("expect requires a pattern argument".into());
+        }
+        let pattern = cmd_args[0];
+        let re = Regex::new(pattern)
+            .map_err(|e| format!("invalid regex '{}': {}", pattern, e))?;
+
+        // --timeout N (ms), default 10000
+        let timeout_ms: u64 = cmd_args.iter()
+            .position(|&a| a == "--timeout")
+            .and_then(|i| cmd_args.get(i + 1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms);
+        let poll = std::time::Duration::from_millis(50);
+
+        loop {
+            let resp = rpc(&Message::ViewScreen { name: name.clone() }).await?;
+            match resp {
+                Message::ScreenData { content, .. } => {
+                    if let Some(m) = re.find(&content) {
+                        // Print the matched text to stdout for script consumption.
+                        println!("{}", m.as_str());
+                        return Ok(());
+                    }
+                }
+                Message::Error { message } => return Err(message),
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("expect: timeout after {}ms waiting for '{}'",
+                                   timeout_ms, pattern));
+            }
+            tokio::time::sleep(poll).await;
+        }
     }
 
     // Special case: `hardcopy` with file argument needs client-side file write
