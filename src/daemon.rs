@@ -216,7 +216,16 @@ fn dispatch_command(name: &str, args: &[String], mgr: &mut SessionManager) -> (M
     match cmd.as_str() {
         "stuff" => {
             let text = cmd_args.join(" ");
-            match mgr.send(name, text.as_bytes()) {
+            #[allow(unused_mut)]
+            let mut data = crate::escape::unescape(&text);
+            // On Windows, ConPTY expects CR for Enter, not LF.
+            #[cfg(windows)]
+            for b in &mut data {
+                if *b == b'\n' {
+                    *b = b'\r';
+                }
+            }
+            match mgr.send(name, &data) {
                 Ok(()) => (Message::Ok, false),
                 Err(e) => (Message::Error { message: e }, false),
             }

@@ -263,20 +263,44 @@ impl Screen {
 
     /// Resize the screen. Content is best-effort preserved.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let new_size = cols as usize * rows as usize;
+        let old_cols = self.cols as usize;
+        let old_rows = self.rows as usize;
+        let new_cols = cols as usize;
+        let new_rows = rows as usize;
+        let new_size = new_cols * new_rows;
+
+        // Resize active cells.
         let mut new_cells = vec![Cell::default(); new_size];
-
-        let copy_cols = self.cols.min(cols) as usize;
-        let copy_rows = self.rows.min(rows) as usize;
-
+        let copy_cols = old_cols.min(new_cols);
+        let copy_rows = old_rows.min(new_rows);
         for r in 0..copy_rows {
-            let src_start = r * self.cols as usize;
-            let dst_start = r * cols as usize;
-            new_cells[dst_start..dst_start + copy_cols]
-                .copy_from_slice(&self.cells[src_start..src_start + copy_cols]);
+            new_cells[r * new_cols..r * new_cols + copy_cols]
+                .copy_from_slice(&self.cells[r * old_cols..r * old_cols + copy_cols]);
+        }
+        self.cells = new_cells;
+
+        // Also resize the saved primary screen so switching back works.
+        if let Some(ref mut saved) = self.alt_saved {
+            let mut saved_new = vec![Cell::default(); new_size];
+            for r in 0..copy_rows {
+                let src = r * old_cols;
+                let dst = r * new_cols;
+                if src + copy_cols <= saved.cells.len() {
+                    saved_new[dst..dst + copy_cols]
+                        .copy_from_slice(&saved.cells[src..src + copy_cols]);
+                }
+            }
+            saved.cells = saved_new;
+            saved.scroll_top = 0;
+            saved.scroll_bottom = rows.saturating_sub(1);
+            if saved.cursor_x >= cols {
+                saved.cursor_x = cols.saturating_sub(1);
+            }
+            if saved.cursor_y >= rows {
+                saved.cursor_y = rows.saturating_sub(1);
+            }
         }
 
-        self.cells = new_cells;
         self.cols = cols;
         self.rows = rows;
         self.scroll_top = 0;
@@ -965,6 +989,23 @@ mod tests {
         // Switch back to primary
         screen.feed(b"\x1b[?1049l");
         assert!(!screen.alt_active);
+        assert_eq!(screen.line_text(0), "Primary");
+    }
+
+    #[test]
+    fn resize_during_alt_screen() {
+        let mut screen = Screen::new(80, 24);
+        screen.feed(b"Primary");
+        // Switch to alt screen
+        screen.feed(b"\x1b[?1049h");
+        screen.feed(b"Alt");
+        // Resize while in alt screen
+        screen.resize(40, 12);
+        assert_eq!(screen.size(), (40, 12));
+        assert_eq!(screen.line_text(0), "Alt");
+        // Switch back — primary should be resized too
+        screen.feed(b"\x1b[?1049l");
+        assert_eq!(screen.size(), (40, 12));
         assert_eq!(screen.line_text(0), "Primary");
     }
 

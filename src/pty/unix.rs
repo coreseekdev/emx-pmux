@@ -2,7 +2,7 @@
 
 use std::ffi::CString;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
 use rustix::fs::OFlags;
 use rustix::pty::{openpt, grantpt, unlockpt, ptsname, OpenptFlags};
@@ -32,15 +32,7 @@ impl PtyMaster {
             return Err(PtyError::Closed);
         }
 
-        #[repr(C)]
-        struct Winsize {
-            ws_row: libc::c_ushort,
-            ws_col: libc::c_ushort,
-            ws_xpixel: libc::c_ushort,
-            ws_ypixel: libc::c_ushort,
-        }
-
-        let ws = Winsize {
+        let ws = libc::winsize {
             ws_row: size.rows,
             ws_col: size.cols,
             ws_xpixel: 0,
@@ -156,7 +148,7 @@ impl PtyChild {
         self.pid
     }
 
-    /// Check if the child is still running (non-blocking).
+    /// Check if the child is still running (non-blocking, mutates cached state).
     pub fn is_running(&mut self) -> bool {
         if self.exited {
             return false;
@@ -165,6 +157,19 @@ impl PtyChild {
             Ok(Some(_)) => false,
             _ => true,
         }
+    }
+
+    /// Check if process is still alive (non-mutating).
+    ///
+    /// Uses `kill(pid, 0)` which checks process existence without sending
+    /// a signal.  This mirrors the Windows `is_process_alive(&self)` API
+    /// so that `Session::is_alive` compiles on both platforms.
+    pub fn is_process_alive(&self) -> bool {
+        if self.exited {
+            return false;
+        }
+        // SAFETY: kill with signal 0 is a standard POSIX existence check.
+        unsafe { libc::kill(self.pid as libc::pid_t, 0) == 0 }
     }
 
     /// Non-blocking wait. Returns exit code if exited.
@@ -288,14 +293,7 @@ pub fn spawn(config: &PtyConfig) -> PtyResult<(PtyMaster, PtyChild)> {
         unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
 
         // Set window size on slave
-        #[repr(C)]
-        struct Winsize {
-            ws_row: libc::c_ushort,
-            ws_col: libc::c_ushort,
-            ws_xpixel: libc::c_ushort,
-            ws_ypixel: libc::c_ushort,
-        }
-        let ws = Winsize {
+        let ws = libc::winsize {
             ws_row: config.size.rows,
             ws_col: config.size.cols,
             ws_xpixel: 0,
