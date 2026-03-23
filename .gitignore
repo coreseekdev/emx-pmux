@@ -13,5 +13,8 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+# Claude Code
+.claude/
+
 # Session files (pmux runtime)
 .pmux/
